@@ -4,6 +4,7 @@ import { z } from "zod";
 import * as vault from "./vault.js";
 import { frontmatterValueToString } from "./frontmatter.js";
 import { registerClipTool } from "./clip.js";
+import { structuredResult } from "mcp-server-kit";
 import { registerLogged, logFeedback, isLoggingEnabled, type ToolResult } from "./log.js";
 import { parseLocalYmd, localYmd } from "./date.js";
 
@@ -178,21 +179,80 @@ function formatMoveReport(result: vault.RewriteResult): string {
   return lines.join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
+// Output schemas for the tools whose results have a stable shape agents navigate by (search hits,
+// tag listings, frontmatter, links). Each schema is passed both as the tool's outputSchema and to
+// structuredResult, so the declared contract and the validated payload can never drift apart.
+// Amorphous outputs (note bodies, prose reports) stay text-only. List-shaped results are rooted in
+// an object (`items`) because MCP requires structuredContent to be a JSON object.
+const titleSearchOutput = z.object({
+  items: z.array(z.object({ path: z.string() })).describe("Matching notes (vault-relative paths)"),
+  truncated: z.boolean().optional().describe("Present and true when the limit was hit"),
+});
+
+const contentSearchOutput = z.object({
+  items: z.array(
+    z.object({
+      path: z.string(),
+      matches: z.array(z.string()).describe("Matching line snippets"),
+    }),
+  ),
+  truncated: z.boolean().optional().describe("Present and true when the limit was hit"),
+});
+
+const frontmatterSearchOutput = z.object({
+  field: z.string(),
+  items: z.array(
+    z.object({
+      path: z.string(),
+      value: z.string().describe("The property's value on this note, rendered for display"),
+    }),
+  ),
+  truncated: z.boolean().optional().describe("Present and true when the limit was hit"),
+});
+
+const frontmatterOutput = z.object({
+  path: z.string().describe("Resolved vault-relative path of the note"),
+  frontmatter: z
+    .record(z.unknown())
+    .nullable()
+    .optional()
+    .describe("All frontmatter keys (null when the note has none). Present when no property was requested."),
+  property: z.string().optional().describe("Present when a single property was requested"),
+  value: z.unknown().describe("The requested property's value; absent when the property was not found"),
+});
+
+const linksOutput = z.object({
+  path: z.string().describe("Resolved vault-relative path of the note"),
+  outgoing: z.array(
+    z.object({
+      title: z.string(),
+      path: z.string().nullable().describe("Resolved path, or null when the linked note wasn't found"),
+    }),
+  ),
+  backlinks: z.array(z.string()).optional().describe("Present when include_backlinks was set"),
+});
+
+const tagsOutput = z.object({
+  tags: z
+    .array(z.object({ tag: z.string(), noteCount: z.number() }))
+    .optional()
+    .describe("Present in list-all mode: tags with note counts, sorted by count descending"),
+  notes: z.array(z.string()).optional().describe("Present in single-tag mode: paths of notes carrying the tag"),
+  truncated: z.boolean().optional().describe("Present and true when the tag list was capped by limit"),
+});
+
 async function titleSearchToolResult(title: string, exact: boolean, limit: number) {
   const results = await vault.findByTitle(title, exact, limit);
-  if (results.length === 0) {
-    return { content: [{ type: "text" as const, text: `No notes found matching "${title}".` }] };
-  }
   const hitLimit = limit > 0 && results.length === limit;
-  const text = results.map((r) => r.path).join("\n");
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: hitLimit ? `${text}\n\n(limit of ${limit} reached — increase limit or use a more specific title)` : text,
-      },
-    ],
-  };
+  return structuredResult(
+    titleSearchOutput,
+    { items: results.map((r) => ({ path: r.path })), ...(hitLimit ? { truncated: true } : {}) },
+    ({ items, truncated }) => {
+      if (items.length === 0) return `No notes found matching "${title}".`;
+      const text = items.map((i) => i.path).join("\n");
+      return truncated ? `${text}\n\n(limit of ${limit} reached — increase limit or use a more specific title)` : text;
+    },
+  );
 }
 
 // Max entries accepted by the batch tools (vault_batch_read, vault_batch_frontmatter_update).
@@ -499,30 +559,29 @@ export async function registerTools(server: McpServer) {
         path: z.string().describe("Vault-relative path or bare note title"),
         property: z.string().optional().describe("If set, return only this frontmatter key"),
       }),
+      outputSchema: frontmatterOutput,
     },
     async ({ path, property }) => {
       const out = await resolveOrError(path);
       if (!out.ok) return out.result;
       if (property !== undefined && property.length > 0) {
         const value = await vault.getFrontmatterProperty(out.ref.path, property);
-        const body =
-          value === undefined
-            ? { content: [{ type: "text" as const, text: `Property "${property}" not found.` }] }
-            : {
-                content: [
-                  {
-                    type: "text" as const,
-                    text: typeof value === "string" ? value : JSON.stringify(value, null, 2),
-                  },
-                ],
-              };
+        const body = structuredResult(
+          frontmatterOutput,
+          { path: out.ref.path, property, ...(value === undefined ? {} : { value }) },
+          () =>
+            value === undefined
+              ? `Property "${property}" not found.`
+              : typeof value === "string" ? value : JSON.stringify(value, null, 2),
+        );
         return withResolveWarning(body, out.ref, path);
       }
       const frontmatter = await vault.getFrontmatter(out.ref.path);
-      const body =
-        frontmatter === null
-          ? { content: [{ type: "text" as const, text: "(no frontmatter)" }] }
-          : { content: [{ type: "text" as const, text: JSON.stringify(frontmatter, null, 2) }] };
+      const body = structuredResult(
+        frontmatterOutput,
+        { path: out.ref.path, frontmatter },
+        () => (frontmatter === null ? "(no frontmatter)" : JSON.stringify(frontmatter, null, 2)),
+      );
       return withResolveWarning(body, out.ref, path);
     },
   );
@@ -538,29 +597,43 @@ export async function registerTools(server: McpServer) {
         include_backlinks: z.boolean().optional().default(false).describe("Also return notes that link to this one (default false)"),
         backlinks_limit: z.number().optional().default(20).describe("Max backlinks to return (default 20, 0 = no limit)"),
       }),
+      outputSchema: linksOutput,
     },
     async ({ path, include_backlinks, backlinks_limit }) => {
       const out = await resolveOrError(path);
       if (!out.ok) return out.result;
       const links = await vault.getNoteLinks(out.ref.path);
-      const lines: string[] = ["## Outgoing links"];
-      if (links.length === 0) {
-        lines.push("(none)");
-      } else {
-        for (const l of links) {
-          lines.push(l.path ? `- [[${l.title}]] → ${l.path}` : `- [[${l.title}]] (not found)`);
-        }
-      }
-      if (include_backlinks) {
-        const backlinks = await vault.getBacklinks(out.ref.path, backlinks_limit);
-        lines.push("", "## Backlinks");
-        if (backlinks.length === 0) {
-          lines.push("(none found)");
-        } else {
-          for (const b of backlinks) lines.push(`- ${b}`);
-        }
-      }
-      return withResolveWarning({ content: [{ type: "text", text: lines.join("\n") }] }, out.ref, path);
+      const backlinks = include_backlinks
+        ? await vault.getBacklinks(out.ref.path, backlinks_limit)
+        : undefined;
+      const body = structuredResult(
+        linksOutput,
+        {
+          path: out.ref.path,
+          outgoing: links.map((l) => ({ title: l.title, path: l.path })),
+          ...(backlinks !== undefined ? { backlinks } : {}),
+        },
+        (parsed) => {
+          const lines: string[] = ["## Outgoing links"];
+          if (parsed.outgoing.length === 0) {
+            lines.push("(none)");
+          } else {
+            for (const l of parsed.outgoing) {
+              lines.push(l.path ? `- [[${l.title}]] → ${l.path}` : `- [[${l.title}]] (not found)`);
+            }
+          }
+          if (parsed.backlinks !== undefined) {
+            lines.push("", "## Backlinks");
+            if (parsed.backlinks.length === 0) {
+              lines.push("(none found)");
+            } else {
+              for (const b of parsed.backlinks) lines.push(`- ${b}`);
+            }
+          }
+          return lines.join("\n");
+        },
+      );
+      return withResolveWarning(body, out.ref, path);
     },
   );
 
@@ -821,6 +894,7 @@ export async function registerTools(server: McpServer) {
         exact: z.boolean().optional().default(false).describe("If true, require full filename match"),
         limit: z.number().optional().default(50).describe("Max matches (default 50, 0 = no limit)"),
       }),
+      outputSchema: titleSearchOutput,
     },
     async ({ title, exact, limit }) => titleSearchToolResult(title, exact, limit),
   );
@@ -838,22 +912,23 @@ export async function registerTools(server: McpServer) {
         limit: z.number().optional().default(20).describe("Max files with matches (default 20, 0 = no limit)"),
         case_sensitive: z.boolean().optional().default(false).describe("Case-sensitive regex (default false)"),
       }),
+      outputSchema: contentSearchOutput,
     },
     async ({ query, folder, limit, case_sensitive }) => {
       const results = await vault.searchContent(query, { folder, limit, caseSensitive: case_sensitive });
-      if (results.length === 0) {
-        return { content: [{ type: "text", text: "No matches found." }] };
-      }
       const hitLimit = limit > 0 && results.length === limit;
-      const text = results.map((r) => `${r.path}:\n${r.matches.map((m) => `  ${m}`).join("\n")}`).join("\n\n");
-      return {
-        content: [
-          {
-            type: "text",
-            text: hitLimit ? `${text}\n\n(limit of ${limit} reached — use folder to narrow the search)` : text,
-          },
-        ],
-      };
+      return structuredResult(
+        contentSearchOutput,
+        {
+          items: results.map((r) => ({ path: r.path, matches: r.matches })),
+          ...(hitLimit ? { truncated: true } : {}),
+        },
+        ({ items, truncated }) => {
+          if (items.length === 0) return "No matches found.";
+          const text = items.map((r) => `${r.path}:\n${r.matches.map((m) => `  ${m}`).join("\n")}`).join("\n\n");
+          return truncated ? `${text}\n\n(limit of ${limit} reached — use folder to narrow the search)` : text;
+        },
+      );
     },
   );
 
@@ -871,28 +946,30 @@ export async function registerTools(server: McpServer) {
         folder: z.string().optional().describe('Limit the scan to this subfolder (e.g. "02-Notes").'),
         limit: z.number().optional().default(20).describe("Max matching notes (default 20, 0 = no limit)"),
       }),
+      outputSchema: frontmatterSearchOutput,
     },
     async ({ field, value, match_type, folder, limit }) => {
       if (match_type !== "exists" && (value === undefined || value === "")) {
         return {
-          content: [{ type: "text", text: `Error: value is required for match_type "${match_type}". Pass a value, or use match_type "exists" to match any note that has the "${field}" property.` }],
+          content: [{ type: "text" as const, text: `Error: value is required for match_type "${match_type}". Pass a value, or use match_type "exists" to match any note that has the "${field}" property.` }],
           isError: true,
         };
       }
       const results = await vault.searchFrontmatter(field, { value, matchType: match_type, folder, limit });
-      if (results.length === 0) {
-        return { content: [{ type: "text", text: "No matching notes found." }] };
-      }
-      const text = results.map((r) => `${r.path}\t${field}: ${renderFrontmatterValue(r.frontmatter[field])}`).join("\n");
       const hitLimit = limit > 0 && results.length === limit;
-      return {
-        content: [
-          {
-            type: "text",
-            text: hitLimit ? `${text}\n\n(limit of ${limit} reached — increase limit or pass a folder to narrow)` : text,
-          },
-        ],
-      };
+      return structuredResult(
+        frontmatterSearchOutput,
+        {
+          field,
+          items: results.map((r) => ({ path: r.path, value: renderFrontmatterValue(r.frontmatter[field]) })),
+          ...(hitLimit ? { truncated: true } : {}),
+        },
+        ({ items, truncated }) => {
+          if (items.length === 0) return "No matching notes found.";
+          const text = items.map((r) => `${r.path}\t${field}: ${r.value}`).join("\n");
+          return truncated ? `${text}\n\n(limit of ${limit} reached — increase limit or pass a folder to narrow)` : text;
+        },
+      );
     },
   );
 
@@ -908,33 +985,34 @@ export async function registerTools(server: McpServer) {
         folder: z.string().optional().describe('Limit the scan to this subfolder (e.g. "02-Notes").'),
         limit: z.number().optional().default(100).describe("When listing all tags: max tags to return (default 100, 0 = no limit)."),
       }),
+      outputSchema: tagsOutput,
     },
     async ({ tag, folder, limit }) => {
       if (tag !== undefined && tag.trim().length > 0) {
         const paths = await vault.getNotesByTag(tag, { folder });
-        if (paths.length === 0) {
-          return { content: [{ type: "text", text: `No notes found with tag "${tag.trim().replace(/^#/, "")}".` }] };
-        }
-        return { content: [{ type: "text", text: paths.join("\n") }] };
+        return structuredResult(tagsOutput, { notes: paths }, ({ notes }) =>
+          notes!.length === 0
+            ? `No notes found with tag "${tag.trim().replace(/^#/, "")}".`
+            : notes!.join("\n"),
+        );
       }
       const tags = await vault.getAllTags({ folder });
-      if (tags.length === 0) {
-        return { content: [{ type: "text", text: "No tags found." }] };
-      }
       const capped = limit > 0 ? tags.slice(0, limit) : tags;
-      const lines = capped.map((t) => `${t.tag}\t${t.noteCount}`);
-      const text = lines.join("\n");
       const truncated = limit > 0 && tags.length > limit;
-      return {
-        content: [
-          {
-            type: "text",
-            text: truncated
-              ? `${text}\n\n(showing top ${limit} of ${tags.length} tags — increase limit or pass a folder to narrow)`
-              : text,
-          },
-        ],
-      };
+      return structuredResult(
+        tagsOutput,
+        {
+          tags: capped.map((t) => ({ tag: t.tag, noteCount: t.noteCount })),
+          ...(truncated ? { truncated: true } : {}),
+        },
+        (parsed) => {
+          if (parsed.tags!.length === 0) return "No tags found.";
+          const text = parsed.tags!.map((t) => `${t.tag}\t${t.noteCount}`).join("\n");
+          return parsed.truncated
+            ? `${text}\n\n(showing top ${limit} of ${tags.length} tags — increase limit or pass a folder to narrow)`
+            : text;
+        },
+      );
     },
   );
 
