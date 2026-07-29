@@ -40,6 +40,12 @@ async function startServer(port: number): Promise<ChildProcess> {
     env: {
       ...process.env,
       VAULT_MCP_TEST: '', // not test mode — the auth module loads its persisted token store at init
+      // This test drives a real PKCE-only exchange, so the child must not inherit auth secrets from
+      // whichever test files ran before it in the shared process — any of these would add a
+      // credential requirement mintToken doesn't satisfy, and no token would ever be persisted.
+      MCP_CLIENT_SECRET: '',
+      APPROVAL_PASSWORD: '',
+      MCP_STATIC_BEARER_TOKEN: '',
       PORT: String(port),
       VAULT_PATH: tmpDir,
       MCP_CLIENT_ID: CLIENT_ID,

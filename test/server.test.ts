@@ -79,6 +79,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   delete process.env.VAULT_MCP_TEST;
+  delete process.env.MCP_CLIENT_SECRET;
   delete process.env.VAULT_CONTEXT_PATH;
   delete process.env.VAULT_DISPLAY_NAME;
   delete process.env.DAILY_NOTE_PATH_TEMPLATE;
