@@ -2,7 +2,7 @@
 // the tool is exposed; if not, registration is skipped silently. Tool returns rendered content
 // (or a needs_interpretation shape for the chat-flow path); caller writes via vault_create.
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";

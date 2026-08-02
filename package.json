@@ -6,21 +6,29 @@
   "scripts": {
     "start": "bun run src/server.ts",
     "test": "VAULT_MCP_TEST=1 bun test",
+    "audit": "bun audit",
     "setup:clipper": "cd node_modules/web-clipper-headless && bun install && bun run setup"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "express": "^4.21.2",
-    "js-yaml": "^4.1.1",
-    "mcp-server-kit": "git+https://github.com/nweii/mcp-server-kit.git#2e3c089e0e80414a6ea48c5332071cc59682d2db",
-    "zod": "^3.24.2"
+    "@modelcontextprotocol/server": "2.0.0",
+    "express": "4.22.2",
+    "hono": "4.12.32",
+    "js-yaml": "4.3.0",
+    "mcp-server-kit": "git+https://github.com/nweii/mcp-server-kit.git#b905680cff757a132d074022ac991d7ce509327a",
+    "zod": "4.2.0"
   },
   "optionalDependencies": {
     "web-clipper-headless": "github:nweii/web-clipper-headless"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
     "@types/express": "^5.0.1",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.0.0"
+  },
+  "overrides": {
+    "body-parser": "1.20.6",
+    "dompurify": "3.4.12",
+    "qs": "6.15.3"
   }
 }

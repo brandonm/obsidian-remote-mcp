@@ -1,5 +1,5 @@
 // ABOUTME: Registers all vault tools on an McpServer - context, read (full/list), outline, read section, read attachment, frontmatter, links, writes, move/rename, title search, content search, tags, periodic note, clip URL, feedback.
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import * as vault from "./vault.js";
 import { frontmatterValueToString } from "./frontmatter.js";
@@ -213,12 +213,12 @@ const frontmatterSearchOutput = z.object({
 const frontmatterOutput = z.object({
   path: z.string().describe("Resolved vault-relative path of the note"),
   frontmatter: z
-    .record(z.unknown())
+    .record(z.string(), z.unknown())
     .nullable()
     .optional()
     .describe("All frontmatter keys (null when the note has none). Present when no property was requested."),
   property: z.string().optional().describe("Present when a single property was requested"),
-  value: z.unknown().describe("The requested property's value; absent when the property was not found"),
+  value: z.unknown().optional().describe("The requested property's value; absent when the property was not found"),
 });
 
 const linksOutput = z.object({

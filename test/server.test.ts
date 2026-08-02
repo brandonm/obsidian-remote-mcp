@@ -822,7 +822,7 @@ describe('MCP /mcp', () => {
     }
   });
 
-  test('POST initialize with valid token returns JSON-RPC result', async () => {
+  test('POST initialize with valid token returns a JSON-RPC result', async () => {
     const { app, auth } = createApp();
     const { base, close } = await listen(app);
     try {
@@ -846,9 +846,9 @@ describe('MCP /mcp', () => {
         }),
       });
       expect(res.ok).toBe(true);
-      const ct = res.headers.get('content-type') ?? '';
-      expect(ct.includes('application/json')).toBe(true);
-      const body = (await res.json()) as {
+      const text = await res.text();
+      const dataLine = text.split('\n').find(line => line.startsWith('data: '));
+      const body = JSON.parse(dataLine ? dataLine.slice(6) : text) as {
         jsonrpc: string;
         id: number;
         result?: { protocolVersion: string; serverInfo: { name: string } };
