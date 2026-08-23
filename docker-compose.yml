@@ -1,6 +1,9 @@
-# ABOUTME: Two-container deployment — a sync worker that owns the vault, and the MCP server that
-# reads it. The vault lives in a named volume rather than a host path, so the only writer is the
-# sync container and the MCP server literally cannot modify it.
+# ABOUTME: Three-container deployment — a sync worker that owns the vault, the MCP server that
+# reads it, and a Cloudflare Tunnel that is the only way in from outside.
+#
+# The shape that matters: nothing publishes a host port. cloudflared reaches the MCP server over
+# the internal compose network, so there is no listening socket on the NAS for anyone on the LAN
+# to find, and no firewall rule to get wrong. Every request arrives through the tunnel.
 #
 # Secrets come from a .env file beside this one (see .env.example). Nothing secret belongs in
 # here — this file is committed. The `:?` suffixes make compose refuse to start with a clear
@@ -9,10 +12,9 @@
 services:
   # The only writer. Pulls the vault down and keeps it current.
   #
-  # NOTE: `image` below is a placeholder — there is no official headless Obsidian sync image, and
-  # I'm not going to invent a name that would silently pull someone else's container. Substitute
-  # whatever you actually run; the only contract that matters here is that it writes the vault to
-  # /vault in this named volume.
+  # NOTE: `image` is a required variable — there is no official headless Obsidian sync image and
+  # putting a name here would silently pull someone else's container. Substitute what you run;
+  # the only contract that matters is that it writes the vault to /vault in this named volume.
   obsidian-sync:
     image: ${SYNC_IMAGE:?set SYNC_IMAGE in .env to your headless Obsidian sync image}
     container_name: obsidian-sync
@@ -22,7 +24,9 @@ services:
     command: ["ob", "sync", "--continuous", "--path", "/vault"]
 
   obsidian-mcp:
-    image: ${MCP_IMAGE:-ghcr.io/brandonm/obsidian-remote-mcp:deploy}
+    # Pin to an immutable tag in production. `:deploy` moves, so a `docker compose pull` could
+    # swap the running code without any version changing. The sha tag, or the digest, cannot.
+    image: ${MCP_IMAGE:-ghcr.io/brandonm/obsidian-remote-mcp:sha-4085cd2}
     container_name: obsidian-mcp
     restart: unless-stopped
     depends_on:
@@ -46,8 +50,8 @@ services:
       # The approval page must be guarded or createAuth throws at construction and the process
       # exits before it listens. This password is the entire gate — make it long and random.
       APPROVAL_PASSWORD: ${APPROVAL_PASSWORD:?set APPROVAL_PASSWORD in .env}
-      # Public origin, scheme + host, no /mcp path. Must match what clients see in the browser.
-      MCP_BASE_URL: ${MCP_BASE_URL:?set MCP_BASE_URL in .env}
+      # The tunnel's public hostname, scheme + host, no /mcp path. Must match what clients see.
+      MCP_BASE_URL: ${MCP_BASE_URL:?set MCP_BASE_URL in .env, e.g. https://mcp.example.com}
 
       # --- Recommended hardening. ---
       # Replaces the built-in default, which also trusts ChatGPT, Cursor and Poke callbacks.
@@ -61,18 +65,44 @@ services:
       - vault-data:/vault:ro
       - mcp-tokens:/app/data
 
-    ports:
-      # Loopback only. A bare "3456:3456" publishes on every host interface and, on Linux, punches
-      # through the host firewall via Docker's iptables rules — which would let anyone on the LAN
-      # reach /authorize directly, bypassing whatever TLS proxy or identity gateway fronts this.
-      # Point your reverse proxy at 127.0.0.1:3456.
-      - "127.0.0.1:3456:3456"
+    # No `ports:` on purpose. cloudflared reaches this over the compose network at
+    # http://obsidian-mcp:3456, so the server is unreachable from the LAN and from the host.
+    # A published port would reintroduce a path that bypasses the tunnel — and with it any
+    # Cloudflare Access policy in front. Uncomment only for local debugging, never in production:
+    #   ports:
+    #     - "127.0.0.1:3456:3456"
 
     # The container needs to write exactly one thing: the token store, which has its own volume.
-    # Everything else can be immutable.
     read_only: true
     tmpfs:
       - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # The only ingress. A remote-managed tunnel: create it in the Cloudflare Zero Trust dashboard
+  # (Networks → Tunnels), copy the token into .env, then add a public hostname routing to
+  # http://obsidian-mcp:3456 — the compose service name, not localhost, since cloudflared runs
+  # in its own container.
+  #
+  # Because the MCP server has no host port, a Cloudflare Access policy on /authorize is a real
+  # gate rather than a suggestion: there is no other route to it. That is what makes
+  # APPROVAL_OPEN=true defensible here — though keeping APPROVAL_PASSWORD set as well costs
+  # nothing and means the app still guards itself if the tunnel config is ever changed.
+  cloudflared:
+    image: cloudflare/cloudflared:2026.8.2
+    container_name: cloudflared
+    restart: unless-stopped
+    depends_on:
+      obsidian-mcp:
+        condition: service_healthy
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env from the Cloudflare Zero Trust dashboard}
+    # Outbound-only: the tunnel dials Cloudflare, so nothing needs to listen and no inbound
+    # firewall rule is required.
+    read_only: true
     security_opt:
       - no-new-privileges:true
     cap_drop:
