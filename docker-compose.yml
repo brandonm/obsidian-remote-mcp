@@ -19,12 +19,14 @@ services:
   #   docker compose run --rm obsidian-sync login
   #   docker compose run --rm obsidian-sync setup
   obsidian-sync:
-    image: ${SYNC_IMAGE:-ghcr.io/brandonm/obsidian-headless-docker:latest}
+    image: ${SYNC_IMAGE:-ghcr.io/brandonm/obsidian-headless-docker:sha-5dec432}
     container_name: obsidian-sync
     restart: unless-stopped
     environment:
       VAULT_PATH: /vault
       REMOTE_VAULT: ${REMOTE_VAULT:-}
+      # Mint once: docker compose run --rm obsidian-sync get-token
+      OBSIDIAN_AUTH_TOKEN: ${OBSIDIAN_AUTH_TOKEN:-}
       # Download-only, and revert anything written locally — so this container cannot push a
       # change back to your other devices no matter what happens to the volume.
       SYNC_MODE: ${SYNC_MODE:-mirror-remote}
