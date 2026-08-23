@@ -25,7 +25,7 @@ services:
   obsidian-sync:
     # Pinned. :latest on the one container holding Obsidian account credentials and owning the
     # vault is the wrong place to accept a moving tag.
-    image: ghcr.io/belphemur/obsidian-headless-sync-docker:${SYNC_IMAGE_TAG:-v0.0.14}
+    image: ghcr.io/belphemur/obsidian-headless-sync-docker:${SYNC_IMAGE_TAG:-0.0.14}
     container_name: obsidian-sync
     restart: unless-stopped
 
