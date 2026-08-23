@@ -1,0 +1,26 @@
+# ABOUTME: Keeps secrets, local state, and build noise out of the image context.
+# Anything not excluded here is readable by anyone who can pull the image.
+
+# Secrets and local state — these must never be baked into a layer.
+tokens.json
+tokens.json*
+.env
+*.env
+logs/
+
+# Dependencies are installed inside the image from the lockfile, not copied.
+node_modules/
+
+# Local tooling and history.
+.git/
+.gitignore
+.github/
+.claude/
+.remember/
+.DS_Store
+@eaDir/
+
+# Not needed at runtime. Tests run in CI or via the test stage, not from the
+# runtime image, so shipping them only widens what the image exposes.
+test/
+dist/
