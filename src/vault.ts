@@ -1,6 +1,6 @@
 // ABOUTME: Filesystem operations for the configured Obsidian vault - safe path resolution, read/write/search, list folder.
 import fs from 'fs/promises';
-import { readFileSync, realpathSync } from 'fs';
+import { readFileSync, realpathSync, statSync } from 'fs';
 import { createHash } from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -145,23 +145,98 @@ export function getContextNotePath(): string | null {
 
 // --- .mcpignore --------------------------------------------------------------
 
-// Patterns from <vault>/.mcpignore — relative paths from vault root, one per line.
-// Lines starting with # are comments. Trailing slashes are stripped before matching.
-function loadIgnorePatterns(): string[] {
-  try {
-    return readFileSync(path.join(getVaultRoot(), '.mcpignore'), 'utf-8')
-      .split('\n')
-      .map(l => l.trim().replace(/\/$/, ''))
-      .filter(l => l && !l.startsWith('#'));
-  } catch {
-    return [];
+// Thrown when the vault root itself can't be read. Distinct from VaultPolicyError: that means
+// "this path is not allowed", this means "the vault is not there, so no answer can be trusted".
+export class VaultUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'VaultUnavailableError';
   }
 }
 
-const IGNORE_PATTERNS = loadIgnorePatterns();
+// Parse the file's text into patterns — relative paths from the vault root, one per line.
+// Lines starting with # are comments. Trailing slashes are stripped before matching.
+function parseIgnorePatterns(text: string): string[] {
+  return text
+    .split('\n')
+    .map(l => l.trim().replace(/\/$/, ''))
+    .filter(l => l && !l.startsWith('#'));
+}
+
+// Refuse to proceed when the vault root isn't a readable directory. Called only on the path
+// where .mcpignore appears to be absent — see getIgnorePatterns for why that case is the
+// dangerous one.
+function assertVaultRootReadable(root: string): void {
+  let isDir = false;
+  try {
+    isDir = statSync(root).isDirectory();
+  } catch {
+    isDir = false;
+  }
+  if (!isDir) {
+    throw new VaultUnavailableError(
+      `Vault root is not a readable directory: ${root}. Refusing to serve, because a missing ` +
+        `or not-yet-mounted vault is indistinguishable from a vault with no .mcpignore — and ` +
+        `treating it as "nothing is ignored" would serve every note unfiltered.`,
+    );
+  }
+}
+
+// The ignore patterns currently on disk, cached against the vault root and the file's
+// mtime+size so an edit is picked up without a restart and without re-reading per call.
+//
+// Two bugs are fixed here versus loading once at import:
+//
+//   1. Fail-open. The old code read .mcpignore at module import inside a bare catch that
+//      returned []. Resolving the vault root does not touch the disk when VAULT_PATH is set,
+//      so a container starting before its NAS volume was ready would read no patterns, start
+//      successfully, and then serve the whole vault with no path blocking for the life of the
+//      process — including after the mount came back. A missing file now forces a check that
+//      the root is actually there, and throws if it isn't.
+//   2. Staleness. Patterns were frozen at import, so editing .mcpignore did nothing until the
+//      process was restarted — with no indication that the new rule wasn't in effect.
+let ignoreCache: { root: string; signature: string; patterns: string[] } | null = null;
+
+function getIgnorePatterns(): string[] {
+  const root = getVaultRoot();
+  const file = path.join(root, '.mcpignore');
+
+  let signature: string;
+  try {
+    const st = statSync(file);
+    signature = `${st.mtimeMs}:${st.size}`;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') throw e;
+    assertVaultRootReadable(root);
+    signature = 'absent';
+  }
+
+  if (ignoreCache && ignoreCache.root === root && ignoreCache.signature === signature) {
+    return ignoreCache.patterns;
+  }
+
+  let patterns: string[];
+  if (signature === 'absent') {
+    patterns = [];
+  } else {
+    try {
+      patterns = parseIgnorePatterns(readFileSync(file, 'utf-8'));
+    } catch (e) {
+      // Deleted between the stat and the read. Re-check the root before concluding that
+      // nothing is ignored, for the same reason as above.
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw e;
+      assertVaultRootReadable(root);
+      patterns = [];
+    }
+  }
+
+  ignoreCache = { root, signature, patterns };
+  return patterns;
+}
 
 function isIgnored(absPath: string): boolean {
-  if (IGNORE_PATTERNS.length === 0) return false;
   const rel = path.relative(getVaultRoot(), absPath);
   return isIgnoredRelative(rel);
 }
@@ -181,9 +256,10 @@ function ignoreKey(p: string): string {
 }
 
 function isIgnoredRelative(rel: string): boolean {
-  if (IGNORE_PATTERNS.length === 0) return false;
+  const patterns = getIgnorePatterns();
+  if (patterns.length === 0) return false;
   const key = ignoreKey(rel);
-  return IGNORE_PATTERNS.some(p => {
+  return patterns.some(p => {
     const pattern = ignoreKey(p);
     return key === pattern || key.startsWith(pattern + path.sep);
   });
