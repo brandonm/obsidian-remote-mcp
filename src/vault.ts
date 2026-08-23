@@ -279,7 +279,7 @@ function assertWritable() {
 // Thrown by resolveSafePath when a path is rejected for security/policy reasons.
 // Carries a typed `kind` so callers can match without parsing error text.
 export class VaultPolicyError extends Error {
-  constructor(public readonly kind: 'escape' | 'mcpignore', message: string) {
+  constructor(public readonly kind: 'escape' | 'mcpignore' | 'dotfile', message: string) {
     super(message);
     this.name = 'VaultPolicyError';
   }
@@ -365,6 +365,8 @@ export function resolveSafePath(relativePath: string): string {
     throw new VaultPolicyError('escape', `Path escapes vault root: ${relativePath}`);
   }
 
+  assertNoDotSegment(path.relative(vaultRoot, resolved), relativePath);
+
   const realRoot = getVaultRealRoot();
   const realResolved = realpathOrNearestExisting(resolved);
 
@@ -375,11 +377,42 @@ export function resolveSafePath(relativePath: string): string {
     );
   }
 
+  // Also on the canonical path: a plainly-named symlink pointing into `.obsidian/` must be
+  // refused for the same reason the direct path is.
+  assertNoDotSegment(path.relative(realRoot, realResolved), relativePath);
+
   if (isIgnoredRelative(path.relative(realRoot, realResolved))) {
     throw new VaultPolicyError('mcpignore', `Path is blocked by .mcpignore: ${relativePath}`);
   }
 
   return resolved;
+}
+
+// Reject any vault-relative path with a dot-segment.
+//
+// Every walk, search and folder listing already skips entries beginning with a dot, so
+// dot-directories were invisible to enumeration — but resolveSafePath did not, leaving them
+// wide open to a direct read or write by name. That gap exposed three things worth protecting
+// in a personal vault: `.trash/` (notes the owner deleted and believes are gone),
+// `.obsidian/plugins/*/data.json` (where community plugins routinely park API keys), and
+// `.mcpignore` itself — readable as a map of which folders are worth asking for, and writable,
+// so an agent could blank out the block list.
+//
+// This aligns the access policy with the enumeration policy that was already in place. The
+// server's own writes into `.trash/` and its atomic-write temp files build their paths directly
+// and do not pass through here, so they are unaffected.
+function assertNoDotSegment(relative: string, original: string): void {
+  if (relative === '') return;
+  for (const segment of relative.split(path.sep)) {
+    if (segment === '' || segment === '.' || segment === '..') continue;
+    if (segment.startsWith('.')) {
+      throw new VaultPolicyError(
+        'dotfile',
+        `Path is not accessible: ${original} — dotfiles and dot-directories (.obsidian, .trash, ` +
+          `.mcpignore) are excluded from MCP access.`,
+      );
+    }
+  }
 }
 
 export async function readNote(relativePath: string): Promise<string> {
