@@ -12,38 +12,68 @@
 services:
   # The only writer. Mirrors the vault down from Obsidian Sync and keeps it current.
   #
-  # Built from github.com/brandonm/obsidian-headless-docker, which wraps `ob` — Obsidian's
-  # official headless client (the obsidian-headless npm package). Requires a Sync subscription.
+  # Belphemur/obsidian-headless-sync-docker, which wraps `ob` — Obsidian's official headless
+  # client. Chosen over a hand-rolled image because obsidian-headless is an open beta at 0.0.x
+  # whose CLI surface moves between patch releases, and this project tracks it release-for-
+  # release. A sync client that quietly stops working is a likelier failure here than a
+  # container escape.
   #
-  # Two one-time interactive steps before this does anything; see that repo's README:
-  #   docker compose run --rm obsidian-sync login
-  #   docker compose run --rm obsidian-sync setup
+  # One-time setup, before `up`:
+  #   docker compose run --rm --entrypoint get-token obsidian-sync
+  # then put the printed value in .env as OBSIDIAN_AUTH_TOKEN. Everything else is declarative —
+  # the container runs sync-setup itself from VAULT_NAME on first start.
   obsidian-sync:
-    image: ${SYNC_IMAGE:-ghcr.io/brandonm/obsidian-headless-docker:sha-5dec432}
+    # Pinned. :latest on the one container holding Obsidian account credentials and owning the
+    # vault is the wrong place to accept a moving tag.
+    image: ghcr.io/belphemur/obsidian-headless-sync-docker:${SYNC_IMAGE_TAG:-v0.0.14}
     container_name: obsidian-sync
     restart: unless-stopped
+
     environment:
-      VAULT_PATH: /vault
-      REMOTE_VAULT: ${REMOTE_VAULT:-}
-      # Mint once: docker compose run --rm obsidian-sync get-token
-      OBSIDIAN_AUTH_TOKEN: ${OBSIDIAN_AUTH_TOKEN:-}
-      # Download-only, and revert anything written locally — so this container cannot push a
-      # change back to your other devices no matter what happens to the volume.
+      OBSIDIAN_AUTH_TOKEN: "${OBSIDIAN_AUTH_TOKEN:?mint one — docker compose run --rm --entrypoint get-token obsidian-sync}"
+      VAULT_NAME: "${VAULT_NAME:?set VAULT_NAME in .env to your remote vault name}"
+      # Required if the vault uses end-to-end encryption.
+      VAULT_PASSWORD: ${VAULT_PASSWORD:-}
+
+      # The most important line in this file. This image's own default is EMPTY, which means
+      # bidirectional — the container could push a change to every device you own. mirror-remote
+      # means download-only and revert local changes, so it cannot.
+      #
+      # Caveat worth knowing: the image applies this best-effort (`|| true` with stderr
+      # discarded), so a failure here is silent. After first start, confirm it actually took:
+      #   docker compose exec obsidian-sync ob sync-status --path /vault
       SYNC_MODE: ${SYNC_MODE:-mirror-remote}
-      # Folders never downloaded. The strongest control available: an excluded folder is not on
-      # disk, so no path bug in the MCP server can reach it. Prefer this over .mcpignore for
-      # anything genuinely private — .mcpignore only hides a file that is present.
+
+      # Folders never downloaded. Stronger than .mcpignore, which can only hide a file that is
+      # already on disk and is therefore only as good as the path handling in front of it. An
+      # excluded folder is one this machine has never seen. Put genuinely private folders here.
       EXCLUDED_FOLDERS: ${EXCLUDED_FOLDERS:-}
+
+      # File ownership inside the shared volume. The MCP server runs as uid 1000 and only reads,
+      # so matching keeps the mount readable without widening permissions.
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+
+      VAULT_PATH: /vault
       DEVICE_NAME: ${DEVICE_NAME:-obsidian-mcp-host}
+
     volumes:
       - vault-data:/vault
-      # Account credentials from `ob login`; without this, every container replacement means
-      # logging in again, MFA prompt included.
-      - obsidian-config:/home/node/.config
+      # Login state. Not strictly required once OBSIDIAN_AUTH_TOKEN is set, but it keeps sync
+      # bookkeeping across container replacement.
+      - obsidian-config:/home/obsidian/.config
+
+    # This image is built on s6-overlay, which supervises as root and drops privileges per
+    # service. That buys PUID/PGID and proper supervision, and it rules out the stricter
+    # options: `cap_drop: ALL` fails its init chown of /vault, `read_only` fails because s6
+    # needs a writable executable /run, and `user: 1000` combined with no-new-privileges fails
+    # outright ("unable to fix /run"). no-new-privileges alone is the practical maximum.
+    #
+    # Accepted deliberately: this container has no inbound exposure, and capability drops would
+    # not defend against its realistic risk anyway — a bad obsidian-headless release already has
+    # legitimate vault and network access.
     security_opt:
       - no-new-privileges:true
-    cap_drop:
-      - ALL
 
   obsidian-mcp:
     # Pin to an immutable tag in production. `:deploy` moves, so a `docker compose pull` could
