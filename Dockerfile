@@ -26,6 +26,19 @@ RUN bun install --frozen-lockfile --production --omit=optional
 
 FROM oven/bun:1.3.11-slim AS runtime
 
+# Passed by the build command; defaults keep a plain `docker build` working.
+ARG GIT_REVISION=unknown
+ARG BUILD_DATE=unknown
+
+# org.opencontainers.image.source is the one that matters operationally: GHCR reads it to link
+# the published package back to the repository, which also drives package permissions. The rest
+# is provenance — being able to answer "what is actually running on the NAS" from the image alone.
+LABEL org.opencontainers.image.source="https://github.com/brandonm/obsidian-remote-mcp" \
+      org.opencontainers.image.description="Remote MCP server for an Obsidian vault, with vault-containment fixes applied and the URL clipper omitted" \
+      org.opencontainers.image.revision="${GIT_REVISION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.base.name="docker.io/oven/bun:1.3.11-slim"
+
 # Unprivileged. The base image ships a `bun` user; the vault mount should be readable by it
 # (and writable only if you are not running with VAULT_READ_ONLY=true).
 WORKDIR /app
@@ -34,10 +47,15 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json bun.lock bunfig.toml ./
 COPY src ./src
 
-# Written at runtime: the token store defaults to ./tokens.json and logs to ./logs. Create them
-# owned by the runtime user so the server can write without running as root. Mount a volume over
-# either one to persist it across container replacement.
-RUN mkdir -p /app/logs && chown -R bun:bun /app/logs /app
+# Written at runtime: the token store and, when logging is on, the JSONL trail.
+#
+# /app/data must exist here *and* be owned by the runtime user, even though a volume normally
+# mounts over it. Docker seeds a new named volume from the image's contents at that path and
+# carries the ownership with it — so if this directory is missing or root-owned, the volume is
+# created root-owned, the server (uid 1000) cannot write tokens.json, and every OAuth sign-in
+# fails with "Failed to persist access token" because the kit refuses to issue a token it
+# couldn't save. Creating it correctly here is what makes the volume writable.
+RUN mkdir -p /app/logs /app/data && chown -R bun:bun /app/logs /app/data /app
 
 USER bun
 

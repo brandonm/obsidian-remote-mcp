@@ -108,7 +108,9 @@ The process listens on port `3456` by default. The MCP endpoint is `POST /mcp`; 
 
 **Docker:**
 
-Save this as `docker-compose.yml` in the cloned repo directory:
+The repo ships a `Dockerfile` and a two-container `docker-compose.yml` (a sync worker that owns the vault, and the MCP server reading it from a shared volume, read-only). Copy `.env.example` to `.env`, fill it in, and `docker compose up -d`.
+
+The sample below is the simpler single-container form, running the source straight from a cloned checkout. Save it as `docker-compose.yml` in the cloned repo directory:
 
 ```yaml
 services:

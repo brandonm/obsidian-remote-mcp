@@ -1,0 +1,83 @@
+# ABOUTME: Two-container deployment — a sync worker that owns the vault, and the MCP server that
+# reads it. The vault lives in a named volume rather than a host path, so the only writer is the
+# sync container and the MCP server literally cannot modify it.
+#
+# Secrets come from a .env file beside this one (see .env.example). Nothing secret belongs in
+# here — this file is committed. The `:?` suffixes make compose refuse to start with a clear
+# message rather than booting a half-configured server.
+
+services:
+  # The only writer. Pulls the vault down and keeps it current.
+  #
+  # NOTE: `image` below is a placeholder — there is no official headless Obsidian sync image, and
+  # I'm not going to invent a name that would silently pull someone else's container. Substitute
+  # whatever you actually run; the only contract that matters here is that it writes the vault to
+  # /vault in this named volume.
+  obsidian-sync:
+    image: ${SYNC_IMAGE:?set SYNC_IMAGE in .env to your headless Obsidian sync image}
+    container_name: obsidian-sync
+    restart: unless-stopped
+    volumes:
+      - vault-data:/vault
+    command: ["ob", "sync", "--continuous", "--path", "/vault"]
+
+  obsidian-mcp:
+    image: ${MCP_IMAGE:-ghcr.io/brandonm/obsidian-remote-mcp:deploy}
+    container_name: obsidian-mcp
+    restart: unless-stopped
+    depends_on:
+      - obsidian-sync
+
+    environment:
+      VAULT_PATH: /vault
+
+      # Belt and braces with the `:ro` mount below. The mount stops the kernel from allowing a
+      # write; this stops the server from trying, so a blocked write returns a clean "vault is in
+      # read-only mode" to the agent instead of an EROFS surfacing as an unexplained failure.
+      VAULT_READ_ONLY: "true"
+
+      # No tool-call log at all. Worth knowing exactly what this turns off: not just note bodies
+      # (those are redacted anyway) but search queries, note paths, titles and tags — which for a
+      # personal vault are often as revealing as the bodies. Also disables vault_feedback.
+      LOG_ENABLED: "false"
+
+      # --- Required. The server refuses to start without these. ---
+      MCP_CLIENT_ID: ${MCP_CLIENT_ID:?set MCP_CLIENT_ID in .env}
+      # The approval page must be guarded or createAuth throws at construction and the process
+      # exits before it listens. This password is the entire gate — make it long and random.
+      APPROVAL_PASSWORD: ${APPROVAL_PASSWORD:?set APPROVAL_PASSWORD in .env}
+      # Public origin, scheme + host, no /mcp path. Must match what clients see in the browser.
+      MCP_BASE_URL: ${MCP_BASE_URL:?set MCP_BASE_URL in .env}
+
+      # --- Recommended hardening. ---
+      # Replaces the built-in default, which also trusts ChatGPT, Cursor and Poke callbacks.
+      MCP_CLIENT_ALLOWED_REDIRECT_URIS: ${MCP_CLIENT_ALLOWED_REDIRECT_URIS:-https://claude.ai/api/mcp/auth_callback}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-https://claude.ai}
+      # Survives container replacement; without it every redeploy forces users to re-authorize.
+      TOKEN_STORE_PATH: /app/data/tokens.json
+
+    volumes:
+      # Read-only. The sync container owns the vault; this one only ever reads it.
+      - vault-data:/vault:ro
+      - mcp-tokens:/app/data
+
+    ports:
+      # Loopback only. A bare "3456:3456" publishes on every host interface and, on Linux, punches
+      # through the host firewall via Docker's iptables rules — which would let anyone on the LAN
+      # reach /authorize directly, bypassing whatever TLS proxy or identity gateway fronts this.
+      # Point your reverse proxy at 127.0.0.1:3456.
+      - "127.0.0.1:3456:3456"
+
+    # The container needs to write exactly one thing: the token store, which has its own volume.
+    # Everything else can be immutable.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  vault-data:
+  mcp-tokens:
