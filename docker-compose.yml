@@ -44,9 +44,10 @@ services:
       #   docker compose exec obsidian-sync ob sync-status --path /vault
       SYNC_MODE: ${SYNC_MODE:-mirror-remote}
 
-      # Folders never downloaded. Stronger than .mcpignore, which can only hide a file that is
-      # already on disk and is therefore only as good as the path handling in front of it. An
-      # excluded folder is one this machine has never seen. Put genuinely private folders here.
+      # Folders never downloaded at all. With the MCP server scoped to one folder by subpath
+      # mount (below), this is no longer what keeps notes away from the agent — it keeps them
+      # off this machine's disk entirely, which is a different and still worthwhile guarantee.
+      # Worth setting for anything you would not want present on the NAS at all.
       EXCLUDED_FOLDERS: ${EXCLUDED_FOLDERS:-}
 
       # File ownership inside the shared volume. The MCP server runs as uid 1000 and only reads,
@@ -113,8 +114,26 @@ services:
       TOKEN_STORE_PATH: /app/data/tokens.json
 
     volumes:
-      # Read-only. The sync container owns the vault; this one only ever reads it.
-      - vault-data:/vault:ro
+      # Scoped to ONE folder of the vault, and read-only.
+      #
+      # `subpath` is what makes this an allowlist rather than a denylist. The container's /vault
+      # IS the AI folder — the rest of the vault is not in its mount namespace at all, so
+      # `/vault/..` is the container root, not your notes. Nothing in the application layer is
+      # being trusted to hide anything: Job Hunt, Ledger and the rest are absent, not filtered.
+      #
+      # This is strictly stronger than .mcpignore, which can only hide files that are present,
+      # and it is why the path-traversal fixes are a second line of defence here rather than
+      # the only one.
+      #
+      # Fail-closed by design: if the folder has not synced yet, the container refuses to start
+      # with "cannot access path ... no such file or directory" rather than coming up scoped to
+      # something unintended. Start obsidian-sync first and let the folder land.
+      - type: volume
+        source: vault-data
+        target: /vault
+        read_only: true
+        volume:
+          subpath: ${AI_FOLDER:-AI}
       - mcp-tokens:/app/data
 
     # No `ports:` on purpose. cloudflared reaches this over the compose network at
