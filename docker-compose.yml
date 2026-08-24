@@ -35,14 +35,34 @@ services:
       # Required if the vault uses end-to-end encryption.
       VAULT_PASSWORD: ${VAULT_PASSWORD:-}
 
-      # The most important line in this file. This image's own default is EMPTY, which means
-      # bidirectional — the container could push a change to every device you own. mirror-remote
-      # means download-only and revert local changes, so it cannot.
+      # The most important line in this file. `ob sync-config --mode` takes exactly three values:
+      # bidirectional, pull-only, mirror-remote. mirror-remote is download-only and actively
+      # REVERTS local changes — new local files are deleted, modified ones re-downloaded over —
+      # so the sidecar cannot push a change to every device you own.
+      #
+      # Blanking this does NOT restore bidirectional, despite what an earlier version of this
+      # comment claimed. The image runs `ob sync-config` only `if [ -n "$SYNC_MODE" ]`, and the
+      # mode is persisted in the obsidian-config volume, so an empty value leaves whatever was
+      # last applied in force — forever. To change it, set it literally.
+      #
+      # Setting bidirectional is what makes MCP writes durable, and it is whole-vault: there is
+      # no per-folder mode, so the subpath mount below stops scoping what can be PUSHED. Only
+      # the MCP server stays confined to one folder.
       #
       # Caveat worth knowing: the image applies this best-effort (`|| true` with stderr
       # discarded), so a failure here is silent. After first start, confirm it actually took:
       #   docker compose exec obsidian-sync ob sync-status --path /vault
       SYNC_MODE: ${SYNC_MODE:-mirror-remote}
+
+      # What happens when the same note changed in two places. The image's default is `merge`:
+      # Google's diff-match-patch, applied to any .md file. An Excalidraw drawing IS a .md file
+      # whose payload is a chunked LZString base64 blob, so a character-level merge of two
+      # versions produces a scene that is wrong — and the dangerous case is not the one that
+      # fails to decode (that surfaces an error) but the one that still decodes into valid JSON,
+      # where nothing warns anybody. `conflict` writes a "(Conflicted copy ...)" file instead,
+      # which is recoverable. Obsidian Sync's own default has the same flaw: it excludes
+      # .canvas from text merge but not Excalidraw .md.
+      CONFLICT_STRATEGY: ${CONFLICT_STRATEGY:-conflict}
 
       # Folders never downloaded at all. With the MCP server scoped to one folder by subpath
       # mount (below), this is no longer what keeps notes away from the agent — it keeps them
@@ -91,7 +111,14 @@ services:
       # Belt and braces with the `:ro` mount below. The mount stops the kernel from allowing a
       # write; this stops the server from trying, so a blocked write returns a clean "vault is in
       # read-only mode" to the agent instead of an EROFS surfacing as an unexplained failure.
-      VAULT_READ_ONLY: "true"
+      #
+      # Enabling writes takes THREE changes, not one, and doing fewer fails in confusing ways:
+      #   1. VAULT_READ_ONLY=false here (compared with === 'true', so any other value allows)
+      #   2. comment out `read_only: true` on the vault-data mount below, or every write is EROFS
+      #   3. SYNC_MODE=bidirectional above, or the sync sidecar reverts each write within seconds
+      # Get 1 and 2 without 3 and writes succeed, report success, and then vanish — which is
+      # strictly worse than the clean refusal you get by leaving this alone.
+      VAULT_READ_ONLY: ${VAULT_READ_ONLY:-true}
 
       # No tool-call log at all. Worth knowing exactly what this turns off: not just note bodies
       # (those are redacted anyway) but search queries, note paths, titles and tags — which for a

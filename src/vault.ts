@@ -876,8 +876,17 @@ export async function writeDrawingScene(
 
   return withPathLock(absPath, async () => {
     const existing = await readForDrawingWrite(absPath, relativePath, baseVersion);
+    // Elements the replacement drops are written back as tombstones rather than just left out.
+    // Dropping them is correct on disk but wrong in a running Obsidian: the plugin's merge for
+    // an open view deletes only ids flagged `isDeleted`, so a merely-absent element is restored
+    // from the view's memory on its next autosave. See tombstoneRemoved for the full reasoning.
+    const previous = excalidraw.readScene(existing, relativePath);
+    const withTombstones = excalidraw.tombstoneRemoved(previous, scene);
     const updated = excalidraw.syncTextElements(
-      excalidraw.spliceScene(existing, scene, relativePath),
+      excalidraw.spliceScene(existing, withTombstones, relativePath),
+      // The live scene, not the tombstoned one. Either would do — syncTextElements already
+      // skips `isDeleted` elements — but passing the live set says the intent outright instead
+      // of relying on that filter staying where it is.
       scene,
     );
     await atomicWriteFile(absPath, updated);

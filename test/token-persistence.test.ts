@@ -34,8 +34,14 @@ function freePort(): Promise<number> {
 }
 
 // Start the real server entry (src/server.ts) as a child process and resolve once it logs readiness.
+//
+// Spawned via process.execPath, not the literal "bun". Under `bun test` execPath IS the bun binary
+// that is already running this file, so the child is guaranteed to be the same runtime and the test
+// stops depending on bun being installed on PATH — which it is in CI and the Docker image, and is
+// not on a machine where bun was unpacked somewhere local. The failure mode that bought this
+// comment was an ENOENT that looked like a token-persistence bug and was a $PATH bug.
 async function startServer(port: number): Promise<ChildProcess> {
-  const child = spawn('bun', ['src/server.ts'], {
+  const child = spawn(process.execPath, ['src/server.ts'], {
     cwd: REPO_ROOT,
     env: {
       ...process.env,

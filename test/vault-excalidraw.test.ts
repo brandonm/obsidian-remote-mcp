@@ -95,7 +95,34 @@ describe('writeDrawingScene', () => {
     const md = await readFile(path.join(vaultPath, DRAWING), 'utf-8');
     expect(md).toContain('## Embedded Files\nffffffff: [[picture.png]]');
     expect(md).toContain('project: ledger');
-    expect(readScene(md, DRAWING).elements).toHaveLength(replacement.elements.length);
+    // The LIVE scene is exactly the replacement. Dropped elements are still in the file as
+    // tombstones (see the next test), so count what survives rather than the raw array.
+    const live = readScene(md, DRAWING).elements.filter(e => !e.isDeleted);
+    expect(live).toHaveLength(replacement.elements.length);
+  });
+
+  test('elements the replacement drops are written back as isDeleted tombstones', async () => {
+    // Omitting an element is not deleting it, and the difference only appears in a running
+    // Obsidian: the plugin's merge for an open view removes only ids flagged isDeleted, so a
+    // merely-absent element is restored from the view's memory on its next autosave and the
+    // "replacement" silently unions the old canvas with the new one.
+    const before = readScene(await readFile(path.join(vaultPath, DRAWING), 'utf-8'), DRAWING);
+    const beforeIds = before.elements.filter(e => !e.isDeleted).map(e => e.id);
+    expect(beforeIds.length).toBeGreaterThan(0);
+
+    const replacement = buildSceneFromSpec({ nodes: [{ label: 'Only' }] });
+    await vault.writeDrawingScene(DRAWING, replacement);
+
+    const after = readScene(await readFile(path.join(vaultPath, DRAWING), 'utf-8'), DRAWING);
+    const dead = new Map(after.elements.filter(e => e.isDeleted).map(e => [e.id, e]));
+    for (const id of beforeIds) {
+      expect(dead.has(id)).toBe(true);
+    }
+    // Tombstones must not leak into the text section, or the next load resurrects their labels.
+    const afterMd = await readFile(path.join(vaultPath, DRAWING), 'utf-8');
+    for (const id of beforeIds) {
+      expect(afterMd).not.toContain(`^${id}`);
+    }
   });
 
   test('the ## Text Elements section is refreshed to match the new scene', async () => {

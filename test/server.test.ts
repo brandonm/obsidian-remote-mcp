@@ -1376,7 +1376,9 @@ describe('Excalidraw drawing tools over MCP', () => {
       const outline = textOf(read);
       // The outline is the point of the tool: labelled shapes and resolved arrows, not base64.
       expect(outline).toContain('"Client"');
-      expect(outline).toMatch(/arrow "https" \(text [A-Za-z0-9]{8}\): "Client" → "Server"/);
+      expect(outline).toMatch(
+        /arrow "https" \(text [A-Za-z0-9]{8}\): \[\w+\] "Client" → \[\w+\] "Server"/,
+      );
       expect(outline).not.toContain('compressed-json');
       expect(outline).toMatch(/version: [0-9a-f]{16}/);
 

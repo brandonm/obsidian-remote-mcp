@@ -155,6 +155,38 @@ export function spliceScene(md: string, scene: ExcalidrawScene, relativePath: st
   });
 }
 
+// Carry forward, as tombstones, every element the replacement scene drops.
+//
+// Omitting an element is not the same as deleting it, and the difference only shows up in a
+// running Obsidian. The plugin's `synchronizeWithData` merges a changed file into an open view
+// element-by-element keyed on id, and it removes only the ids the incoming data reports in
+// `deletedElements` — i.e. those carrying `isDeleted: true`. An element that is simply absent
+// from the new scene is never matched, so it survives in memory and is written straight back on
+// the next autosave. A whole-scene replace against a drawing someone has open therefore *unions*
+// the old canvas with the new one instead of replacing it, and the file on disk is briefly right
+// before Obsidian puts the old shapes back.
+//
+// Marking them keeps the deletion legible to that merge. Already-dead elements are passed
+// through untouched rather than re-versioned, so a no-op write stays byte-identical.
+export function tombstoneRemoved(
+  previous: ExcalidrawScene,
+  next: ExcalidrawScene,
+): ExcalidrawScene {
+  const nextIds = new Set(next.elements.map(e => e.id));
+  const dropped = previous.elements.filter(e => !nextIds.has(e.id));
+  if (dropped.length === 0) return next;
+
+  const tombstones = dropped.map(e =>
+    e.isDeleted
+      ? e
+      : // Bump the version so the merge prefers this over whatever the open view is holding:
+        // the tie-break is `memory.version < incoming.version`, and an equal version falls back
+        // to a serialization compare that the in-memory copy can win.
+        { ...e, isDeleted: true, version: (typeof e.version === 'number' ? e.version : 0) + 1 },
+  );
+  return { ...next, elements: [...next.elements, ...tombstones] };
+}
+
 // --- The ## Text Elements section -------------------------------------------
 
 export const TEXT_ELEMENTS_HEADING = '## Text Elements';
@@ -384,13 +416,25 @@ export function outlineScene(scene: ExcalidrawScene, options: OutlineOptions = {
     }
   }
 
-  const oneLine = (text: string): string => text.replace(/\n/g, ' ');
+  // Render a line break as the literal escape, not as a space. A label is routinely read out of
+  // the outline and handed straight back to `vault_excalidraw_set_text`, whose `content` takes
+  // `\n` for a break — so collapsing here silently flattens a two-line label on the round trip.
+  // That is the worst shape of bug available to this tool: an edit that reports success, changes
+  // something the caller never asked to change, and reads as a no-op in the diff they can see.
+  const oneLine = (text: string): string => text.replace(/\n/g, '\\n');
 
-  const describe = (el: ExcalidrawElement | undefined): string => {
+  // Endpoints carry the shape's id, not just its label. Labels are not unique — the reference
+  // vault has drawings where "transaction" and "book Expenses" each name several distinct boxes,
+  // and a label-only rendering made 68% of one drawing's edges unresolvable. The id is already
+  // printed on the Shapes lines, so leading with it here also keeps the two sections greppable
+  // against each other.
+  const describe = (endpoint: Endpoint): string => {
+    const el = endpoint.el;
     if (!el) return 'nothing';
+    const mark = endpoint.inferred ? ' ~inferred' : '';
     const label = labelByShape.get(el.id);
-    if (label) return `"${oneLine(label.text)}"`;
-    return `${el.type} at (${Math.round(el.x)}, ${Math.round(el.y)})`;
+    if (label) return `[${el.id}] "${oneLine(label.text)}"${mark}`;
+    return `[${el.id}] ${el.type} at (${Math.round(el.x)}, ${Math.round(el.y)})${mark}`;
   };
 
   if (shapes.length > 0) {
@@ -406,14 +450,23 @@ export function outlineScene(scene: ExcalidrawScene, options: OutlineOptions = {
 
   const connectors = live.filter(e => e.type === 'arrow' || e.type === 'line');
   if (connectors.length > 0) {
+    let anyInferred = false;
     const lines = connectors.map(el => {
       const from = resolveEndpoint(el, 'start', bindCandidates, byId);
       const to = resolveEndpoint(el, 'end', bindCandidates, byId);
+      if (from.inferred || to.inferred) anyInferred = true;
       const label = labelByShape.get(el.id);
       const arrowText = label ? ` "${oneLine(label.text)}" (text ${label.id})` : '';
       return `  [${el.id}] ${el.type}${arrowText}: ${describe(from)} → ${describe(to)}`;
     });
-    sections.push(`Connections:\n${lines.join('\n')}`);
+    // An endpoint recovered by the geometric fallback is a reading of the picture, not a fact
+    // stored in the file: the arrow has no binding and will not follow the shape if it is
+    // dragged. Printing it identically to a bound edge invites an agent to state a relationship
+    // the drawing does not actually assert, so the guesses are marked and the marker explained.
+    const legend = anyInferred
+      ? ' (~inferred = endpoint resolved by proximity, not a stored binding)'
+      : '';
+    sections.push(`Connections${legend}:\n${lines.join('\n')}`);
   }
 
   // Standalone labels, titles and canvas notes — plus any text whose container was erased.
@@ -468,6 +521,13 @@ export function applyTextOverrides(
   };
 }
 
+// A resolved connector endpoint, and whether it was read off an explicit binding or guessed
+// from geometry. The distinction is reported to the agent, so it has to survive the call.
+interface Endpoint {
+  el: ExcalidrawElement | undefined;
+  inferred: boolean;
+}
+
 // Which shape a connector's end points at: its binding if it has one, otherwise the nearest
 // shape to the endpoint's absolute position.
 function resolveEndpoint(
@@ -475,15 +535,15 @@ function resolveEndpoint(
   which: 'start' | 'end',
   shapes: ExcalidrawElement[],
   byId: Map<string, ExcalidrawElement>,
-): ExcalidrawElement | undefined {
+): Endpoint {
   const binding = connector[`${which}Binding`] as { elementId?: string } | null | undefined;
   if (binding?.elementId) {
     const bound = byId.get(binding.elementId);
-    if (bound) return bound;
+    if (bound) return { el: bound, inferred: false };
   }
 
   const points = connector.points as [number, number][] | undefined;
-  if (!points || points.length === 0) return undefined;
+  if (!points || points.length === 0) return { el: undefined, inferred: false };
   const point = which === 'start' ? points[0]! : points[points.length - 1]!;
   const px = connector.x + point[0];
   const py = connector.y + point[1];
@@ -502,7 +562,7 @@ function resolveEndpoint(
       best = shape;
     }
   }
-  return best;
+  return { el: best, inferred: best !== undefined };
 }
 
 // --- Building elements ------------------------------------------------------
@@ -530,7 +590,11 @@ export function newElementId(used: Set<string>): string {
 
 // Fields every element carries. Excalidraw's restore() fills most defaults, but a scene written
 // straight to disk is read by the plugin before restore in some paths, so they are all written.
-function elementBase(id: string, now: number): Record<string, unknown> {
+// The `id: string` in the return type is load-bearing, not decoration. Every caller spreads this
+// into an object literal that is then an ExcalidrawElement, and ExcalidrawElement requires a
+// string id — a bare Record<string, unknown> makes the spread contribute `unknown`, so the literal
+// no longer overlaps the target type and each construction site needs a cast to compile.
+function elementBase(id: string, now: number): { id: string } & Record<string, unknown> {
   return {
     id,
     angle: 0,

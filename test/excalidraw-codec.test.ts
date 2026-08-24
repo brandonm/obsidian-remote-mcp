@@ -18,6 +18,7 @@ import {
   decompressScene,
   isCompressedMarkdown,
   isDrawingMarkdown,
+  tombstoneRemoved,
   outlineScene,
   parseTextElements,
   readScene,
@@ -420,20 +421,44 @@ describe('creating a new drawing file', () => {
 });
 
 describe('outlining a scene', () => {
-  test('resolves bound arrows to the shapes they connect', () => {
+  test('resolves bound arrows to the shapes they connect, and carries each endpoint id', () => {
     const outline = outlineScene(sampleScene());
     expect(outline).toContain('"source"');
-    expect(outline).toMatch(/arrow: "source" → rectangle/);
+    // Endpoints print their shape id. Labels are not unique in real drawings, so a label-only
+    // rendering leaves duplicate-labelled edges genuinely unresolvable.
+    expect(outline).toMatch(/arrow: \[\w+\] "source" → \[\w+\] rectangle/);
+    // A real binding is not a guess and must not be marked as one.
+    expect(outline).not.toContain('~inferred');
   });
 
-  test('resolves an unbound arrow geometrically', () => {
+  test('resolves an unbound arrow geometrically, and marks it as inferred', () => {
     // Hand-drawn diagrams routinely have arrows that were never bound; without the fallback the
-    // outline reports a wall of unconnected arrows and says nothing about structure.
+    // outline reports a wall of unconnected arrows and says nothing about structure. But a
+    // proximity guess is a reading of the picture, not a fact stored in the file, so it is
+    // labelled — otherwise an agent restates it as a relationship the drawing never asserted.
     const scene = sampleScene();
     const arrow = scene.elements.find(e => e.type === 'arrow')!;
     delete arrow.startBinding;
     delete arrow.endBinding;
-    expect(outlineScene(scene)).toMatch(/arrow: "source" → rectangle/);
+    const outline = outlineScene(scene);
+    expect(outline).toMatch(/arrow: \[\w+\] "source" ~inferred → \[\w+\] rectangle[^\n]*~inferred/);
+    expect(outline).toContain('~inferred = endpoint resolved by proximity');
+  });
+
+  test('a multi-line label prints its break as \\n, not as a space', () => {
+    // The outline is the source an agent copies a label from before handing it back to
+    // vault_excalidraw_set_text, whose `content` takes \\n for a break. Collapsing the newline
+    // to a space here made that round trip silently flatten two-line labels — an edit that
+    // reports success and quietly changes something nobody asked to change.
+    const scene = sampleScene();
+    const text = scene.elements.find(e => e.id === 'cccccccc')!;
+    text.text = 'transaction\nrule';
+    text.rawText = 'transaction\nrule';
+    text.originalText = 'transaction\nrule';
+
+    const outline = outlineScene(scene);
+    expect(outline).toContain('"transaction\\nrule"');
+    expect(outline).not.toContain('"transaction rule"');
   });
 
   test('erased elements are excluded but counted', () => {
@@ -618,7 +643,7 @@ describe('regressions from the adversarial review', () => {
     delete arrow.startBinding;
     delete arrow.endBinding;
     // A point inside the frame scores distance 0 and would beat every real shape.
-    expect(outlineScene(scene)).toMatch(/arrow: "source" → rectangle/);
+    expect(outlineScene(scene)).toMatch(/arrow: \[\w+\] "source" ~inferred → \[\w+\] rectangle/);
   });
 
   test('text whose container was erased still appears, flagged', () => {
@@ -744,5 +769,47 @@ describe('layout: an arrow must not be drawn through a box', () => {
     expect(at('top') < at('bottom')).toBe(true);
     // Layer 1 is re-ordered to follow layer 0 rather than keeping declaration order.
     expect(at('fromTop') < at('fromBottom')).toBe(true);
+  });
+});
+
+describe('tombstoneRemoved', () => {
+  test('marks dropped elements isDeleted and bumps their version', () => {
+    const previous = sampleScene();
+    const next = { ...previous, elements: previous.elements.filter(e => e.id === 'aaaaaaaa') };
+
+    const result = tombstoneRemoved(previous, next);
+    const byId = new Map(result.elements.map(e => [e.id, e]));
+
+    expect(byId.get('aaaaaaaa')!.isDeleted).toBeFalsy();
+    for (const id of ['bbbbbbbb', 'cccccccc', 'dddddddd']) {
+      expect(byId.get(id)).toBeDefined();
+      expect(byId.get(id)!.isDeleted).toBe(true);
+    }
+    // The merge in an open Obsidian view prefers the incoming element only when its version is
+    // higher; an equal version falls back to a serialization compare the in-memory copy can win.
+    const before = previous.elements.find(e => e.id === 'bbbbbbbb')!;
+    const after = byId.get('bbbbbbbb')!;
+    expect(after.version as number).toBeGreaterThan((before.version as number) ?? 0);
+  });
+
+  test('an unchanged element set produces no tombstones and returns the scene as-is', () => {
+    const previous = sampleScene();
+    const next = sampleScene();
+    // Byte-identity matters here: a no-op write that grew the file would cost a sync
+    // replication to every device for a change nobody made.
+    expect(tombstoneRemoved(previous, next)).toBe(next);
+  });
+
+  test('already-dead elements are carried through untouched, not re-versioned', () => {
+    const previous = sampleScene();
+    const dead = previous.elements.find(e => e.id === 'bbbbbbbb')!;
+    dead.isDeleted = true;
+    dead.version = 7;
+    const next = { ...previous, elements: previous.elements.filter(e => e.id !== 'bbbbbbbb') };
+
+    const result = tombstoneRemoved(previous, next);
+    const carried = result.elements.find(e => e.id === 'bbbbbbbb')!;
+    expect(carried.version).toBe(7);
+    expect(carried).toBe(dead);
   });
 });
