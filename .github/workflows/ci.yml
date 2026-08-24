@@ -16,7 +16,12 @@ permissions:
 
 concurrency:
   # A second push to the same branch cancels the first — the older result is never the one you want.
-  group: ci-${{ github.ref }}
+  #
+  # github.workflow is in the key for a reason found the hard way: publish.yml calls this workflow,
+  # and a reusable call inherits the CALLER's github.workflow but evaluates this block. Keyed on
+  # ref alone, the standalone CI run and the copy running inside Publish landed in one group and
+  # cancelled each other — the first push showed CI "cancelled after 2s" next to a running Publish.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
