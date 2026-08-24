@@ -301,16 +301,25 @@ let vaultRealRootCache: { root: string; realRoot: string } | null = null;
 function getVaultRealRoot(): string {
   const root = getVaultRoot();
   if (vaultRealRootCache?.root === root) return vaultRealRootCache.realRoot;
-  // If the root itself can't be canonicalized (missing mount), fall back to the lexical root
-  // rather than throwing — the caller's own I/O will fail with a clearer error.
-  let realRoot: string;
   try {
-    realRoot = realpathSync(root);
+    const realRoot = realpathSync(root);
+    vaultRealRootCache = { root, realRoot };
+    return realRoot;
   } catch {
-    realRoot = root;
+    // The root isn't there — an unmounted volume, or a directory not created yet. Falling back
+    // to the *lexical* root would canonicalize only one side of the containment check below:
+    // realpathOrNearestExisting still resolves the root's existing ancestors for every child, so
+    // on any system where an ancestor is a symlink (macOS puts /var -> /private/var, and a Docker
+    // bind mount can do the same) every path is reported as escaping through a symlink. That is
+    // the wrong diagnosis for the commonest cause by far — a vault that simply isn't mounted.
+    //
+    // Canonicalizing the same way keeps both sides comparable, so containment passes and the
+    // caller's own I/O (or the .mcpignore fail-closed guard) produces the accurate error.
+    //
+    // Deliberately not cached: the root may appear later (late mount), and if it turns out to be
+    // a symlink itself this approximation would be wrong for the life of the process.
+    return realpathOrNearestExisting(root);
   }
-  vaultRealRootCache = { root, realRoot };
-  return realRoot;
 }
 
 // Canonicalize as much of `absPath` as exists, then re-append the segments that don't.
