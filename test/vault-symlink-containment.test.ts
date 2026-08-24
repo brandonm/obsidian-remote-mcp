@@ -163,3 +163,62 @@ describe('unchanged behaviour', () => {
     );
   });
 });
+
+describe('a vault root that is not present yet', () => {
+  // The containment check compares a canonicalized target against a canonicalized root. When the
+  // root itself cannot be canonicalized — an unmounted volume, a directory not created yet —
+  // falling back to the lexical root canonicalizes only one side: realpathOrNearestExisting still
+  // resolves the root's existing ancestors for every child. On any system where an ancestor is a
+  // symlink (macOS resolves /var to /private/var, and a Docker bind mount can do the same) every
+  // path is then reported as escaping through a symlink.
+  //
+  // That is the wrong diagnosis for the commonest cause by far, and it masks the real one, so the
+  // fallback canonicalizes the same way the child paths do.
+  test('a missing root is not misreported as a symlink escape', async () => {
+    const base = await mkdtemp(path.join(os.tmpdir(), 'vault-unmounted-'));
+    // Only meaningful where an ancestor really is a symlink; elsewhere this asserts the
+    // unchanged behaviour, which is also correct.
+    const ancestorIsSymlink = realpathSync(base) !== base;
+
+    const previous = process.env.VAULT_PATH;
+    process.env.VAULT_PATH = path.join(base, 'not-mounted-yet');
+    try {
+      const mod = await import(`../src/vault.js?vault-unmounted=${Date.now()}`);
+      let message = '';
+      try {
+        mod.resolveSafePath('anything.md');
+      } catch (e) {
+        message = (e as Error).message;
+      }
+      expect(message).not.toMatch(/through a symlink/);
+      if (ancestorIsSymlink) expect(message).not.toMatch(/escapes vault root/);
+    } finally {
+      process.env.VAULT_PATH = previous;
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  test('a root that appears later resolves against its canonical path', async () => {
+    const base = await mkdtemp(path.join(os.tmpdir(), 'vault-late-'));
+    const late = path.join(base, 'late-mount');
+    const previous = process.env.VAULT_PATH;
+    process.env.VAULT_PATH = late;
+    try {
+      const mod = await import(`../src/vault.js?vault-late=${Date.now()}`);
+      // Resolving before the mount must not poison the memoized real root for the rest of the
+      // process — the directory that appears may itself be a symlink.
+      try {
+        mod.resolveSafePath('Open.md');
+      } catch {
+        /* whatever it throws here, the mount is what matters */
+      }
+      await mkdir(late, { recursive: true });
+      await writeFile(path.join(late, 'Open.md'), 'now here\n');
+      expect(() => mod.resolveSafePath('Open.md')).not.toThrow();
+      await expect(mod.readNote('Open.md')).resolves.toBe('now here\n');
+    } finally {
+      process.env.VAULT_PATH = previous;
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+});
