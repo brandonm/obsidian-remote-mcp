@@ -1313,3 +1313,207 @@ describe('Health /health', () => {
     });
   });
 });
+
+describe('Excalidraw drawing tools over MCP', () => {
+  // Same SSE-or-JSON unwrapping as the resolution round-trips above; kept local so this block
+  // can be read (and moved) on its own.
+  async function callTool(
+    base: string,
+    token: string,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<{ content?: Array<{ type: string; text: string }>; isError?: boolean }> {
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: Math.floor(Math.random() * 100000),
+        method: 'tools/call',
+        params: { name, arguments: args },
+      }),
+    });
+    expect(res.ok).toBe(true);
+    const text = await res.text();
+    const dataLine = text.split('\n').find(line => line.startsWith('data: '));
+    const body = JSON.parse(dataLine ? dataLine.slice(6) : text) as {
+      result?: { content?: Array<{ type: string; text: string }>; isError?: boolean };
+      error?: { message: string };
+    };
+    if (body.error) throw new Error(body.error.message);
+    return body.result ?? {};
+  }
+
+  const textOf = (r: { content?: Array<{ text: string }> }) =>
+    (r.content ?? []).map(c => c.text).join('\n');
+
+  test('create, read, retitle and re-read a drawing end to end', async () => {
+    const { app, auth } = createApp();
+    const { base, close } = await listen(app);
+    const drawing = 'E2EDiagram.md';
+    try {
+      const token = auth.seedTestToken();
+
+      const created = await callTool(base, token, 'vault_excalidraw_create', {
+        path: drawing,
+        content: {
+          nodes: [{ label: 'Client' }, { label: 'Server' }, { label: 'Vault' }],
+          edges: [
+            { from: 'Client', to: 'Server', label: 'https' },
+            { from: 'Server', to: 'Vault' },
+          ],
+        },
+      });
+      expect(created.isError).toBeFalsy();
+      expect(textOf(created)).toContain('3 shapes, 2 arrows');
+
+      const read = await callTool(base, token, 'vault_excalidraw_read', { path: drawing });
+      expect(read.isError).toBeFalsy();
+      const outline = textOf(read);
+      // The outline is the point of the tool: labelled shapes and resolved arrows, not base64.
+      expect(outline).toContain('"Client"');
+      expect(outline).toMatch(/arrow "https" \(text [A-Za-z0-9]{8}\): "Client" → "Server"/);
+      expect(outline).not.toContain('compressed-json');
+      expect(outline).toMatch(/version: [0-9a-f]{16}/);
+
+      // The documented set_text workflow, end to end: take the id straight off the outline line
+      // and rename with it. The shape's own leading [id] is a different 8-character id, so it
+      // sails past the schema's length check and fails in the format layer — which is exactly
+      // the trap this asserts against.
+      const shapeLine = /\[([A-Za-z0-9]{8})\] rectangle "Client" \(text ([A-Za-z0-9]{8})\)/.exec(outline);
+      expect(shapeLine).not.toBeNull();
+      const [, shapeId, textId] = shapeLine!;
+      expect(shapeId).not.toBe(textId);
+
+      const wrongId = await callTool(base, token, 'vault_excalidraw_set_text', {
+        path: drawing,
+        element_id: shapeId,
+        content: 'nope',
+      });
+      expect(wrongId.isError).toBe(true);
+      expect(textOf(wrongId)).toContain('(text <id>)');
+
+      const renamed = await callTool(base, token, 'vault_excalidraw_set_text', {
+        path: drawing,
+        element_id: textId,
+        content: 'Claude.ai',
+      });
+      expect(renamed.isError).toBeFalsy();
+      expect(textOf(await callTool(base, token, 'vault_excalidraw_read', { path: drawing }))).toContain(
+        'Claude.ai',
+      );
+    } finally {
+      await close();
+      await rm(path.join(vaultPath, drawing), { force: true });
+    }
+  });
+
+  test('a stale base_version comes back as isError, not a thrown exception', async () => {
+    const { app, auth } = createApp();
+    const { base, close } = await listen(app);
+    const drawing = 'E2EStale.md';
+    try {
+      const token = auth.seedTestToken();
+      await callTool(base, token, 'vault_excalidraw_create', {
+        path: drawing,
+        content: { nodes: [{ label: 'One' }] },
+      });
+      const version = /version: ([0-9a-f]{16})/.exec(
+        textOf(await callTool(base, token, 'vault_excalidraw_read', { path: drawing })),
+      )![1];
+
+      await callTool(base, token, 'vault_excalidraw_update', {
+        path: drawing,
+        content: { nodes: [{ label: 'Two' }] },
+      });
+      const stale = await callTool(base, token, 'vault_excalidraw_update', {
+        path: drawing,
+        content: { nodes: [{ label: 'Three' }] },
+        base_version: version,
+      });
+      expect(stale.isError).toBe(true);
+      expect(textOf(stale)).toContain('changed since you last read it');
+
+      expect(textOf(await callTool(base, token, 'vault_excalidraw_read', { path: drawing }))).toContain(
+        '"Two"',
+      );
+    } finally {
+      await close();
+      await rm(path.join(vaultPath, drawing), { force: true });
+    }
+  });
+
+  test('reading an ordinary note points the agent back at vault_read', async () => {
+    const { app, auth } = createApp();
+    const { base, close } = await listen(app);
+    const plain = 'E2EPlain.md';
+    try {
+      await writeFile(path.join(vaultPath, plain), '# not a drawing\n', 'utf-8');
+      const token = auth.seedTestToken();
+      const result = await callTool(base, token, 'vault_excalidraw_read', { path: plain });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain('Use vault_read for ordinary notes');
+    } finally {
+      await close();
+      await rm(path.join(vaultPath, plain), { force: true });
+    }
+  });
+
+  test('an edge naming a missing node reports the position without logging the label', async () => {
+    const { app, auth } = createApp();
+    const { base, close } = await listen(app);
+    try {
+      const token = auth.seedTestToken();
+      const result = await callTool(base, token, 'vault_excalidraw_create', {
+        path: 'E2ENeverWritten.md',
+        content: { nodes: [{ label: 'Alpha' }], edges: [{ from: 'Alpha', to: 'Ghost' }] },
+      });
+      expect(result.isError).toBe(true);
+      // First block is what the audit log records — positions only. The label goes in the second.
+      expect(result.content![0]!.text).toContain('edges[0].to');
+      expect(result.content![0]!.text).not.toContain('Ghost');
+      expect(result.content![1]!.text).toContain('Ghost');
+    } finally {
+      await close();
+    }
+  });
+
+  test('all four drawing tools are advertised in tools/list', async () => {
+    const { app, auth } = createApp();
+    const { base, close } = await listen(app);
+    try {
+      const token = auth.seedTestToken();
+      const res = await fetch(`${base}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/list', params: {} }),
+      });
+      const text = await res.text();
+      const dataLine = text.split('\n').find(line => line.startsWith('data: '));
+      const body = JSON.parse(dataLine ? dataLine.slice(6) : text) as {
+        result: { tools: Array<{ name: string; annotations?: { readOnlyHint?: boolean } }> };
+      };
+      const names = body.result.tools.map(t => t.name);
+      for (const tool of [
+        'vault_excalidraw_read',
+        'vault_excalidraw_create',
+        'vault_excalidraw_update',
+        'vault_excalidraw_set_text',
+      ]) {
+        expect(names).toContain(tool);
+      }
+      const read = body.result.tools.find(t => t.name === 'vault_excalidraw_read')!;
+      expect(read.annotations?.readOnlyHint).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+});

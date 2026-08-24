@@ -14,6 +14,7 @@ import {
   type FrontmatterMatchType,
 } from './frontmatter.js';
 import { isoWeek, isoWeekYear, startOfIsoWeek, startOfMonth, startOfQuarter, startOfYear } from './date.js';
+import * as excalidraw from './excalidraw.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_CONTEXT_NOTE_CANDIDATES = ['AGENTS.md', 'CLAUDE.md'] as const;
@@ -838,6 +839,127 @@ export async function replaceInNote(relativePath: string, find: string, content:
     await atomicWriteFile(absPath, existing.replace(find, () => content));
   });
   invalidateResolverCache();
+}
+
+// --- Excalidraw drawings -----------------------------------------------------
+//
+// Drawings are ordinary `.md` notes carrying `excalidraw-plugin:` frontmatter and a fenced
+// scene in a `%%`-hidden `## Drawing` section (see src/excalidraw.ts for the format). They are
+// handled here rather than through the generic note helpers for two reasons: the scene is
+// compressed, so vault_read returns a page of base64 instead of anything an agent can use; and
+// every write has to splice the existing wrapper rather than rebuild it, because the wrapper
+// carries state — `## Element Links`, `## Embedded Files`, the note's own frontmatter — that the
+// scene JSON does not.
+
+export interface DrawingRead {
+  scene: excalidraw.ExcalidrawScene;
+  markdown: string;
+  version: string;
+}
+
+export async function readDrawing(relativePath: string): Promise<DrawingRead> {
+  const markdown = await readNote(relativePath);
+  return { scene: excalidraw.readScene(markdown, relativePath), markdown, version: versionOf(markdown) };
+}
+
+// Replace a drawing's scene, and refresh `## Text Elements` to match it. Both edits are
+// splices into the file already on disk, done inside one lock so a concurrent write can't
+// interleave, and committed with atomicWriteFile — this vault is mirrored by a sync sidecar,
+// and a torn write to a 300 KB drawing would be replicated to every device.
+export async function writeDrawingScene(
+  relativePath: string,
+  scene: excalidraw.ExcalidrawScene,
+  baseVersion?: string,
+): Promise<UpdateResult> {
+  assertWritable();
+  const absPath = resolveSafePath(relativePath);
+
+  return withPathLock(absPath, async () => {
+    const existing = await readForDrawingWrite(absPath, relativePath, baseVersion);
+    const updated = excalidraw.syncTextElements(
+      excalidraw.spliceScene(existing, scene, relativePath),
+      scene,
+    );
+    await atomicWriteFile(absPath, updated);
+    return { version: versionOf(updated) };
+  });
+}
+
+// Retitle one text element by rewriting only its line in `## Text Elements`. That section
+// outranks the scene JSON on load — the plugin copies the text out of it and recomputes the
+// element's geometry with real font metrics — so this is both the safest edit available (the
+// compressed blob is never decoded, let alone rewritten) and the only one that reliably sticks.
+export async function setDrawingText(
+  relativePath: string,
+  elementId: string,
+  text: string,
+  baseVersion?: string,
+): Promise<UpdateResult> {
+  assertWritable();
+  const absPath = resolveSafePath(relativePath);
+
+  return withPathLock(absPath, async () => {
+    const existing = await readForDrawingWrite(absPath, relativePath, baseVersion);
+    const updated = excalidraw.spliceTextElement(existing, elementId, text);
+    await atomicWriteFile(absPath, updated);
+    return { version: versionOf(updated) };
+  });
+}
+
+// Shared preamble for the two drawing writers: read the current bytes, confirm the file really
+// is a drawing, and enforce optimistic concurrency. Runs inside the caller's lock.
+async function readForDrawingWrite(
+  absPath: string,
+  relativePath: string,
+  baseVersion?: string,
+): Promise<string> {
+  let existing: string;
+  try {
+    existing = await fs.readFile(absPath, 'utf-8');
+  } catch (e) {
+    // Only a caller that supplied a base_version demonstrably read the file, so only they can be
+    // told it was deleted underneath them. Without one the likelier truth is a wrong path, and
+    // claiming a concurrent delete would send the agent hunting for a race that never happened.
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT' && baseVersion !== undefined) {
+      throw new ConcurrentEditError(
+        `"${relativePath}" no longer exists — it was deleted or moved since you read it. ` +
+          `Call vault_excalidraw_create to make a new drawing.`,
+      );
+    }
+    throw e;
+  }
+
+  if (!excalidraw.isDrawingMarkdown(existing)) {
+    throw new excalidraw.NotADrawingError(relativePath);
+  }
+
+  if (baseVersion !== undefined && versionOf(existing) !== baseVersion) {
+    throw new ConcurrentEditError(
+      `"${relativePath}" changed since you last read it, so writing would discard another ` +
+        `session's edit — or a change Obsidian itself just autosaved. Re-read the drawing and ` +
+        `reapply your change.`,
+    );
+  }
+
+  return existing;
+}
+
+// Write a new drawing, refusing to overwrite an existing note. The `.md` extension is required
+// by Obsidian (it only indexes markdown) and is appended when the caller omits it; the plugin
+// detects drawings by frontmatter, not by filename, so `Name.excalidraw.md` is conventional but
+// not necessary — the drawings already in this vault are plain `*.md`.
+export async function createDrawing(
+  relativePath: string,
+  scene: excalidraw.ExcalidrawScene,
+): Promise<{ path: string }> {
+  if (relativePath.trim() === '' || relativePath.trimEnd().endsWith('/')) {
+    throw new Error('A drawing path needs a filename, e.g. "Drawings/Ledger flow".');
+  }
+  // Strip any case variant and re-append lowercase, so "Name.MD" becomes "Name.md" rather than
+  // being written verbatim — on a case-sensitive volume Obsidian would not index it.
+  const target = `${relativePath.replace(/\.md$/i, '')}.md`;
+  await createNote(target, excalidraw.createDrawingMarkdown(scene));
+  return { path: target };
 }
 
 export async function deleteNote(relativePath: string): Promise<void> {

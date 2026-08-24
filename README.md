@@ -187,6 +187,10 @@ The server currently exposes these tools:
 | `vault_search_frontmatter` | Find notes by a frontmatter property (match type `exact`, `contains`, or `exists`) |
 | `vault_tags` | List all tags with note counts, or note paths for one `tag`; counts frontmatter and inline `#tag` |
 | `vault_periodic_note` | Read or create a daily, weekly, monthly, quarterly, or yearly note using a per-cadence path template |
+| `vault_excalidraw_read` | Read an Excalidraw drawing as structure — shapes with labels and ids, arrows resolved to what they connect (`format` `outline` / `text` / `scene`) |
+| `vault_excalidraw_create` | Create a drawing from a node/edge description; layout, ids and arrow bindings are generated |
+| `vault_excalidraw_update` | Replace a drawing's scene — the note survives, the canvas does not; optional `base_version` |
+| `vault_excalidraw_set_text` | Change one element's text without touching the scene — the safest edit to a drawing |
 | `vault_clip_url` | Save a web page to the vault as a markdown note |
 | `vault_feedback` | Log a structured note when an agent gets stuck or wants a tool that doesn't exist |
 
@@ -410,6 +414,19 @@ YEARLY_NOTE_PATH_TEMPLATE=Yearly/{YYYY}.md
 - `vault_move` takes explicit vault-relative paths (with extension) for both source and destination — bare titles are rejected, since a move is a mutation and title resolution adds ambiguity exactly where it isn't wanted. Use `vault_search_title` first to find the path. It also rewrites the wikilinks that point at the moved file, across note bodies and frontmatter (string and array values) and `.canvas` node paths.
 - `vault_move` rewrites conservatively. `dry_run` defaults to `true`: the call returns the full plan — every file and the rewrites it would make, plus `.base` files to review and any ambiguous links it would skip — and writes nothing, not even the move. Pass `dry_run: false` to move the file (first) and apply the rewrites (after). All wikilink forms are handled — `[[Note]]`, `[[folder/Note]]`, `[[Note#Heading]]`, `[[Note#^block]]`, `[[Note|alias]]`, embeds `![[Note]]`, links carrying an explicit extension, and combinations — with the alias, heading, and block parts preserved.
 - A pure move (same filename, new folder) leaves bare `[[Name]]` links alone, since Obsidian still resolves them by filename; only path-form links are repointed. A rename rewrites every form. If another file shares the old basename, bare-name links are ambiguous and skipped with a warning rather than guessed. Wikilinks inside fenced code blocks and inline code are left untouched. `.base` files are never edited — any that mention the old name or path are reported for manual attention, because rewriting strings inside Base formulas is too risky. `.mcpignore`d notes are neither scanned nor modified.
+
+### Excalidraw drawings
+
+The Excalidraw plugin stores each drawing as an ordinary `.md` note: `excalidraw-plugin: parsed` in the frontmatter, a `## Text Elements` section of plain-text labels, and the scene itself as LZ-compressed base64 in a `%%`-hidden `## Drawing` block. The `vault_excalidraw_*` tools read and write that wrapper directly.
+
+- **Use them instead of `vault_read` / `vault_update` on any drawing.** `vault_read` returns the scene as a page of base64; `vault_update` would rebuild the file and destroy `## Element Links`, `## Embedded Files` (vault image references and LaTeX), and the note's own frontmatter and prose. Every write here splices into the existing text instead.
+- **`## Text Elements` outranks the scene JSON.** On load the plugin copies text out of that section into the elements and recomputes their geometry. So `vault_excalidraw_set_text` edits only the section — the compressed scene is never decoded, which makes it the safest available edit — and `vault_excalidraw_update` refreshes the section to match the scene it writes, since leaving it stale would mean the new text is silently discarded the next time the drawing is opened. Reads apply the same precedence, so a label is reported as Obsidian will show it.
+- **Writes are byte-identical when nothing changed.** The codec reproduces the plugin's own chunking (256-character lines separated by a blank line), so writing back an unchanged scene leaves the file untouched and costs no Obsidian Sync replication.
+- **Erased strokes, `appState` and embedded-file references survive.** Elements marked `isDeleted` stay deleted rather than reappearing as live art.
+- **`vault_excalidraw_update` replaces the whole canvas.** The *note* is preserved — frontmatter, prose, `## Element Links`, `## Embedded Files` — but every element goes, including images, embeds, frames and freehand strokes the tool can't re-create. Read the drawing first; if the outline lists any of those, edit it in Obsidian. `vault_excalidraw_set_text` changes a label without touching anything else.
+- **Each outline line carries two ids.** The leading `[id]` is the shape; `(text <id>)` is its label. `vault_excalidraw_set_text` takes the text one — both are 8 characters, so the shape id fails a length check that can't catch it.
+- **Close the drawing in Obsidian before editing it through MCP.** An open Excalidraw view autosaves every 60 seconds from its own in-memory scene and can overwrite an external write. Passing `base_version` from `vault_excalidraw_read` turns that race into a rejected write rather than a lost one.
+- Drawings are detected by frontmatter, not filename, so `Name.md` works as well as `Name.excalidraw.md`. New drawings are written wherever you ask; the plugin's own "new drawing" folder setting does not apply.
 
 ## Similar projects
 

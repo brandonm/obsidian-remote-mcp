@@ -1,9 +1,10 @@
-// ABOUTME: Registers all vault tools on an McpServer - context, read (full/list), outline, read section, read attachment, frontmatter, links, writes, move/rename, title search, content search, tags, periodic note, clip URL, feedback.
+// ABOUTME: Registers all vault tools on an McpServer - context, read (full/list), outline, read section, read attachment, frontmatter, links, writes, move/rename, title search, content search, tags, periodic note, excalidraw drawings, clip URL, feedback.
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import * as vault from "./vault.js";
 import { frontmatterValueToString } from "./frontmatter.js";
 import { registerClipTool } from "./clip.js";
+import { registerExcalidrawTools } from "./excalidraw-tools.js";
 import { structuredResult } from "mcp-server-kit";
 import { registerLogged, logFeedback, isLoggingEnabled, type ToolResult } from "./log.js";
 import { parseLocalYmd, localYmd } from "./date.js";
@@ -295,6 +296,11 @@ export async function registerTools(server: McpServer) {
       err instanceof Error ? err.message : err,
     );
   }
+
+  // vault_excalidraw_*. Not wrapped like the clip tool above: that one guards an optional
+  // dependency that may legitimately be absent, whereas these need only lz-string, a regular
+  // dependency. If they can't register, the install is broken and startup should say so.
+  registerExcalidrawTools(server);
 
   registerLogged(server,
     "vault_context",
