@@ -212,6 +212,31 @@ bun test
 
 Uses a temporary `VAULT_PATH` and `VAULT_MCP_TEST=1` (see `package.json` `test` script). Covers discovery metadata, `GET /mcp` → 405 with a valid token, and a minimal `POST ... initialize` MCP round-trip.
 
+## Dependency advisories
+
+`bun audit` runs in CI advisory-only, because a new advisory against a transitive dependency should
+be visible without blocking an unrelated fix. It is not noise to be ignored, though — as of the last
+sweep it reported eleven, and the two that mattered were direct and reachable:
+
+- `js-yaml` 4.3.0 → **4.3.1**. Quadratic CPU consumption resolving `!!omap`. This server parses YAML
+  frontmatter on every note read, so it was the one advisory sitting directly in a hot path.
+- `hono` 4.12.32 → **4.13.3**. ReDoS in the CORS middleware via `Access-Control-Request-Headers`, on
+  a service published to the internet through cloudflared.
+- `ip-address` → pinned to **10.5.0** via `overrides`. Arrives through `express-rate-limit`; the
+  high finding is an SSRF/trust-boundary bypass from decoding leading-zero octets as decimal.
+
+Three remain, and all three are accepted deliberately rather than outstanding:
+
+- `defuddle` (high) and `dompurify` (moderate) reach the lockfile through `web-clipper-headless`,
+  which the Dockerfile installs with `--omit=optional` and therefore **does not ship**. Verified by
+  installing the image's dependency set and confirming neither package is present.
+- `@hono/node-server` is a path traversal **on Windows** via an encoded backslash. The image is
+  Linux.
+
+Worth knowing when reading that list: `bun audit` resolves against the lockfile, not against what a
+given install actually produced, so it reports clipper packages even for a production install that
+omits them. Checking `node_modules` is what settles whether an advisory is real for the deployment.
+
 ## Install policy
 
 `bunfig.toml` gates installs. Don't remove it.
