@@ -1,0 +1,54 @@
+# ABOUTME: Every push and pull request — install, typecheck, test, and fail on documentation drift.
+#
+# Deliberately does NOT build the image. A Docker build is minutes of work that tells you nothing a
+# failing test would not have told you first, and this repo's publish path already builds from a
+# clean checkout. Keeping CI fast is what makes it get read.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call: # so publish.yml can require a green run before pushing an image
+
+permissions:
+  contents: read
+
+concurrency:
+  # A second push to the same branch cancels the first — the older result is never the one you want.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Pinned to the runtime the Dockerfile ships, so CI cannot pass on a bun the image
+          # will never run.
+          bun-version: 1.3.11
+
+      # bunfig.toml sets frozenLockfile — this fails loudly if bun.lock is out of date rather
+      # than silently resolving something new, which is the whole point of committing the lock.
+      - name: Install
+        run: bun install
+
+      - name: Typecheck
+        # scripts/typecheck.ts, not an inline pipeline: the obvious `tsc | grep && exit 1` form
+        # reports success when tsc cannot run at all. See the comment in that file.
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
+
+      - name: Docs drift
+        run: bun run check:docs
+
+      - name: Audit
+        # Advisory. A new advisory against a transitive dependency should be visible without
+        # blocking an unrelated fix from merging.
+        continue-on-error: true
+        run: bun audit

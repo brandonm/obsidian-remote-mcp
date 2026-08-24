@@ -116,9 +116,18 @@ export function registerExcalidrawTools(server: McpServer): void {
           .optional()
           .default(500)
           .describe('Refuse to outline scenes larger than this rather than returning an unusably long result.'),
+        max_bytes: z
+          .number()
+          .int()
+          .positive()
+          .default(60000)
+          .describe(
+            'format="scene" only: refuse to return scene JSON longer than this many characters. ' +
+              'Real drawings routinely exceed what a client can inline (~25k tokens is ~90k characters of this JSON).',
+          ),
       }),
     },
-    async ({ path, format, max_elements }) => {
+    async ({ path, format, max_elements, max_bytes }) => {
       try {
         const { scene, markdown, version } = await vault.readDrawing(path);
 
@@ -128,13 +137,30 @@ export function registerExcalidrawTools(server: McpServer): void {
         if (format === 'scene') {
           // Overlaid for the same reason the outline is: the markdown section outranks the JSON,
           // so the raw element text can contradict what Obsidian renders after any set_text.
-          body = JSON.stringify(excalidraw.applyTextOverrides(scene, overrides), null, 1);
+          const json = JSON.stringify(excalidraw.applyTextOverrides(scene, overrides), null, 1);
+          // A real drawing's scene JSON is far larger than any client will inline. Five of the
+          // seven drawings in the reference vault exceed a 25k-token budget, and the failure is
+          // not the server's — the client truncates or spills to a file, and the agent is left
+          // holding a stub it cannot reason about. Refusing with the numbers and a pointer to
+          // format="outline" is more useful than succeeding into a wall. The cap is a character
+          // count, not a token count, because the server cannot know the caller's tokenizer;
+          // ~3.6 chars/token is what this JSON measures, so the default lands near 25k tokens.
+          body =
+            json.length > max_bytes
+              ? `Scene JSON is ${json.length} characters (${scene.elements.length} elements), over the ${max_bytes}-character cap.\n\n` +
+                `Most clients cannot inline this — it measures roughly ${Math.round(json.length / 3.6)} tokens.\n` +
+                `Use format="outline" for structure and element ids, which is what almost every task needs, ` +
+                `or raise max_bytes if you genuinely need the raw JSON.`
+              : json;
         } else if (format === 'text') {
           const entries = [...overrides];
           body =
             entries.length === 0
               ? '(no text elements)'
-              : entries.map(([id, text]) => `[${id}] ${text.replace(/\n/g, ' ')}`).join('\n');
+              : // The literal escape, not a space — same reason as the outline. This is the view an
+                // agent copies a label from before passing it to vault_excalidraw_set_text, whose
+                // `content` takes \n, so collapsing here silently flattens two-line labels.
+                entries.map(([id, text]) => `[${id}] ${text.replace(/\n/g, '\\n')}`).join('\n');
         } else {
           // Overlay the markdown text section, which Obsidian treats as authoritative. Without
           // it a label just changed by vault_excalidraw_set_text would read back stale, because

@@ -1371,6 +1371,25 @@ describe('Excalidraw drawing tools over MCP', () => {
       expect(created.isError).toBeFalsy();
       expect(textOf(created)).toContain('3 shapes, 2 arrows');
 
+      // format="scene" refuses rather than handing back something no client can inline. Five of
+      // the seven drawings in the reference vault exceed a 25k-token budget; the caller gets the
+      // numbers and a pointer to the outline instead of a truncated blob.
+      const capped = await callTool(base, token, 'vault_excalidraw_read', {
+        path: drawing,
+        format: 'scene',
+        max_bytes: 200,
+      });
+      expect(capped.isError).toBeFalsy();
+      expect(textOf(capped)).toContain('over the 200-character cap');
+      expect(textOf(capped)).toContain('format="outline"');
+      // Under the cap it is still real JSON, not the refusal message.
+      const rawScene = await callTool(base, token, 'vault_excalidraw_read', {
+        path: drawing,
+        format: 'scene',
+        max_bytes: 5_000_000,
+      });
+      expect(textOf(rawScene)).toContain('"elements"');
+
       const read = await callTool(base, token, 'vault_excalidraw_read', { path: drawing });
       expect(read.isError).toBeFalsy();
       const outline = textOf(read);
@@ -1398,6 +1417,24 @@ describe('Excalidraw drawing tools over MCP', () => {
       });
       expect(wrongId.isError).toBe(true);
       expect(textOf(wrongId)).toContain('(text <id>)');
+
+      // A label written with a line break must read back carrying the break, in every format.
+      // set_text's `content` takes \n, so a view that collapses it to a space turns an
+      // outline-to-set_text round trip into silent data loss.
+      const multi = await callTool(base, token, 'vault_excalidraw_set_text', {
+        path: drawing,
+        element_id: textId,
+        content: 'Client\napp',
+      });
+      expect(multi.isError).toBeFalsy();
+      const asText = await callTool(base, token, 'vault_excalidraw_read', {
+        path: drawing,
+        format: 'text',
+      });
+      expect(textOf(asText)).toContain('Client\\napp');
+      expect(textOf(asText)).not.toContain('Client app');
+      const asOutline = await callTool(base, token, 'vault_excalidraw_read', { path: drawing });
+      expect(textOf(asOutline)).toContain('Client\\napp');
 
       const renamed = await callTool(base, token, 'vault_excalidraw_set_text', {
         path: drawing,

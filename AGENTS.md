@@ -63,6 +63,8 @@ MCP endpoint: `POST /mcp` (requires Bearer token)
 | `MONTHLY_NOTE_PATH_TEMPLATE` | no | Monthly-cadence path template. Opt-in; `period: monthly` errors until set. |
 | `QUARTERLY_NOTE_PATH_TEMPLATE` | no | Quarterly-cadence path template. Opt-in; `period: quarterly` errors until set. |
 | `YEARLY_NOTE_PATH_TEMPLATE` | no | Yearly-cadence path template. Opt-in; `period: yearly` errors until set. |
+| `RESOLVE_INDEX_TTL_MS` | no | How long the bare-title → path resolver index is cached, in ms. Defaults to `30000`. Lower it if notes are created outside the server and must resolve by title immediately. |
+| `WEB_CLIPPER_SETTINGS_PATH` | no | Path to the Obsidian Web Clipper settings JSON used by `vault_clip_url` (vault-relative or absolute). Unset, the server looks for `*obsidian-web-clipper-settings*.json` in the vault. |
 | `VAULT_ATTACHMENT_MAX_BYTES` | no | Max bytes `vault_read_attachment` will read before rejecting. Defaults to `10485760` (10 MB). |
 | `CORS_ALLOWED_ORIGINS` | no | Comma-separated browser origin allowlist. Defaults to `*`. |
 | `TOKEN_STORE_PATH` | no | Path to the persisted bearer token store. Defaults to `./tokens.json`. |
@@ -135,6 +137,67 @@ MCP endpoint: `POST /mcp` (requires Bearer token)
 - The plugin keeps a per-save backup, but it is not a vault-level one and must not be relied on as a safety net for external writers. On each save the *previous* `lastSavedData` is stashed via `getImageCache().addBAKToCache(path, data)` into an IndexedDB object store, and only when the scene had elements. Recovery is always prompted, never automatic: `BACKUP_AVAILABLE` on a load failure, and `BACKUP_SAVE_AS_FILE` when a drawing loads with zero elements and the stashed copy is longer than what is on disk — which is exactly the shape a corrupted `compressed-json` block takes. It lives in one device's browser profile, covers only drawings that device has opened and saved, and does not sync. A local undo, not a backup.
 - **Both sync paths merge Excalidraw drawings as text, and that is the largest standing risk to a drawing.** Obsidian Sync's own conflict resolution defaults to "Automatically merge", which for Markdown means Google's diff-match-patch; `.canvas` files are explicitly excluded and get last-modified-wins instead, but an Excalidraw drawing is a `.md` file, so it lands in the character-merge bucket with no such protection. The headless client (`CONFLICT_STRATEGY`, default `merge`) runs the same algorithm class. Interleaving two LZString base64 payloads character-by-character is not a merge in any meaningful sense. The failure that matters is not the loud one — a payload that fails to decompress surfaces an error and can reach the backup prompt — but the quiet one, where the merged base64 still decodes into structurally valid JSON with a plausible element count, so nothing throws, no prompt fires, and the drawing is simply wrong. Set conflict resolution to "Create conflict file" (`CONFLICT_STRATEGY=conflict` on the headless side): a `(Conflicted copy …)` note is recoverable, a character-merged scene is not. Obsidian Sync version history — one month on Standard, twelve on Plus, and drawings count as notes — is the only recovery path that is actually off-device.
 - `editNoteSection` and `readNoteSection` are asymmetric on duplicate headings, by design. **Writes refuse to guess**: `editNoteSection` throws an `AmbiguousHeadingError` (carrying every match's line number and a one-line preview) and points the caller at `vault_edit` with a find-anchored `replace` on text unique to the target section. **Reads return everything**: `readNoteSection` joins all matching sections with `<!-- match N of M (line X) -->` labels so the agent can tell candidates apart. The asymmetry tracks the difference in stakes — a write to the wrong section is data loss; a read of all candidates is a couple extra tokens.
+
+## CI and publishing
+
+Two workflows, in `.github/workflows/`.
+
+`ci.yml` runs on every push and pull request: install (with `frozenLockfile`, so a stale `bun.lock`
+fails loudly), typecheck, `bun test`, and a documentation-drift check. It deliberately does not
+build the image — a Docker build is minutes that tell you nothing a failing test would not have
+told you first, and CI only gets read if it stays fast. `bun audit` runs advisory-only, so a new
+transitive advisory is visible without blocking an unrelated fix.
+
+`publish.yml` runs CI first, then builds and pushes to GHCR tagged both `sha-<short>` and the branch
+name, smoke-tests the published image by starting it and requiring `POST /mcp` to answer 401, and
+then **repins `docker-compose.yml` and `.env.example` to the sha it just published**. That last step
+is the point of the workflow. Every stale-image incident here has had the same shape: an image is
+built and pushed, `docker compose pull` runs on the NAS, and nothing changes — because the compose
+default and the `.env` pin still name an older sha. Publish and repin are one operation or they
+drift. The repin commit is pushed with `GITHUB_TOKEN`, and pushes made with that token do not
+trigger workflows, so it cannot loop.
+
+`scripts/check-docs.ts` is what keeps this file honest. It fails when an environment variable is
+read in `src/` but has no row in the table above, when a documented variable is no longer read, or
+when a registered tool is missing from the roster below. Two scanning subtleties, both from real
+misses: not every variable is read as `process.env.NAME` — the periodic-note templates live in a map
+of string literals and are looked up indirectly — and a few names are genuinely internal, so they
+are listed explicitly in `INTERNAL` rather than silently skipped.
+
+## Tools
+
+The full registered roster, 27 tools. `scripts/check-docs.ts` fails CI when a tool is registered
+and missing here, so this list cannot quietly fall behind the code.
+
+| Tool | Kind | What it does |
+|------|------|--------------|
+| `vault_context` | read | Vault context — the context note plus a folder tree |
+| `vault_read` | read | Read a note in full, or list one folder level |
+| `vault_batch_read` | read | Read several notes at once; `include_content: false` for triage |
+| `vault_outline` | read | Heading outline of a note |
+| `vault_read_section` | read | One section under a heading; returns every match when ambiguous |
+| `vault_read_attachment` | read | Read a non-markdown attachment, capped by `VAULT_ATTACHMENT_MAX_BYTES` |
+| `vault_frontmatter` | read | Parsed frontmatter for a note |
+| `vault_links` | read | Outgoing links and backlinks |
+| `vault_search_title` | read | Find notes by filename |
+| `vault_search_content` | read | Full-text search across note bodies |
+| `vault_search_frontmatter` | read | Find notes by a frontmatter property (`exact` / `contains` / `exists`) |
+| `vault_tags` | read | List tags, or the notes carrying one |
+| `vault_create` | write | Create a note; refuses to overwrite |
+| `vault_update` | write | Replace a note's body; takes `base_version` |
+| `vault_edit` | write | Find-and-replace within a note |
+| `vault_edit_section` | write | Replace one section; refuses on an ambiguous heading |
+| `vault_set_frontmatter_property` | write | Single-key frontmatter splice, preserving byte form |
+| `vault_batch_frontmatter_update` | write | Frontmatter across several notes, per-item and non-transactional |
+| `vault_move` | write | Move or rename, rewriting inbound links |
+| `vault_trash` | write (destructive) | Move a note to `.trash` — see the subpath caveat above |
+| `vault_periodic_note` | write | Read or create the note for a period |
+| `vault_clip_url` | write | Clip a URL using a Web Clipper template |
+| `vault_feedback` | write | Log a structured note when a tool is missing or stuck; needs `LOG_ENABLED` |
+| `vault_excalidraw_read` | read | Drawing as outline / text / scene |
+| `vault_excalidraw_create` | write | New drawing from a node-edge spec |
+| `vault_excalidraw_update` | write (destructive) | Replace a whole scene; discards images, frames, freedraw |
+| `vault_excalidraw_set_text` | write | Retitle one text element — the safest drawing write |
 
 ## Tests
 

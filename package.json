@@ -7,7 +7,9 @@
     "start": "bun run src/server.ts",
     "test": "VAULT_MCP_TEST=1 bun test",
     "audit": "bun audit",
-    "setup:clipper": "cd node_modules/web-clipper-headless && bun install && bun run setup"
+    "setup:clipper": "cd node_modules/web-clipper-headless && bun install && bun run setup",
+    "check:docs": "bun run scripts/check-docs.ts",
+    "typecheck": "bun run scripts/typecheck.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",

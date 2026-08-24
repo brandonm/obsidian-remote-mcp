@@ -1,0 +1,164 @@
+# ABOUTME: Build and publish the container image to GHCR, then repin the deployment files to the
+# digest that was actually published.
+#
+# The repin step is the point. Every stale-image incident in this repo has had the same shape: an
+# image is built and pushed, `docker compose pull` is run on the NAS, and the running code does not
+# change — because docker-compose.yml and .env.example still name an older sha. Publishing and
+# repinning are one operation or they drift, so they are one job here.
+#
+# Runs CI first via workflow_call. An image that fails its own test suite should never reach a
+# registry, and "I'll check the tests separately" is how it happens anyway.
+name: Publish
+
+on:
+  push:
+    branches: [deploy, main]
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Target platforms'
+        required: false
+        default: 'linux/amd64'
+        type: choice
+        options:
+          - linux/amd64
+          - linux/amd64,linux/arm64
+      repin:
+        description: 'Commit the new sha into docker-compose.yml and .env.example'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never two publishes at once — the second would repin over the first.
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the repin commit
+      packages: write # push to GHCR
+    outputs:
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute tags
+        id: meta
+        # github.sha is a commit hash, not attacker-controlled text, but it still goes through env
+        # rather than being interpolated into the script body — the habit is what keeps the one
+        # workflow that DOES read a title from being the exception.
+        env:
+          FULL_SHA: ${{ github.sha }}
+        run: |
+          SHORT="${FULL_SHA:0:7}"
+          echo "short_sha=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          # Lowercase: GHCR rejects an uppercase path segment, and repo owners can be mixed case.
+          echo "image=ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+        if: contains(inputs.platforms, 'arm64')
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ inputs.platforms || 'linux/amd64' }}
+          push: true
+          # `deploy` moves; the sha tag is the one to pin. Both are pushed so an operator can use
+          # either knowingly.
+          tags: |
+            ${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.short_sha }}
+            ${{ steps.meta.outputs.image }}:${{ github.ref_name }}
+          build-args: |
+            GIT_REVISION=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false # keeps the package listing a single image, not an unnamed attestation pair
+
+      - name: Smoke test the published image
+        # Proves the image starts and serves before anything is repinned to it. /mcp answering 401
+        # is success: it means the server is up and the auth layer is engaged.
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.short_sha }}
+        run: |
+          mkdir -p /tmp/smoke-vault
+          docker run -d --name smoke -p 3456:3456 \
+            -e VAULT_PATH=/vault -e MCP_CLIENT_ID=smoke -e APPROVAL_PASSWORD=smoke \
+            -e MCP_BASE_URL=https://smoke.test -e LOG_ENABLED=false \
+            -v /tmp/smoke-vault:/vault "$IMAGE"
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:3456/mcp || true)
+            if [ "$code" = "401" ]; then echo "server up, /mcp returned 401 as expected"; break; fi
+            if [ "$i" = "30" ]; then echo "::error::image did not serve /mcp"; docker logs smoke; exit 1; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:3456/.well-known/oauth-authorization-server > /dev/null \
+            && echo "discovery endpoint OK"
+          docker rm -f smoke
+
+      - name: Repin deployment files
+        if: github.event_name == 'push' || inputs.repin
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SHORT: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          # Rewrite only the tag, never the whole line — the compose default and the .env.example
+          # pin have surrounding text that carries meaning.
+          sed -i -E "s#(${IMAGE}):sha-[0-9a-f]+#\1:sha-${SHORT}#g" docker-compose.yml .env.example
+          if git diff --quiet; then
+            echo "pins already current — nothing to commit"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docker-compose.yml .env.example
+          # A push made with GITHUB_TOKEN does not trigger workflows, so this cannot loop.
+          git commit -m "build: repin to sha-${SHORT}" \
+                     -m "Published by the Publish workflow from ${GITHUB_SHA}."
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SHORT: ${{ steps.meta.outputs.short_sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "${IMAGE}:sha-${SHORT}"
+            echo "${DIGEST}"
+            echo '```'
+            echo
+            echo "On the NAS:"
+            echo '```bash'
+            echo "git pull && docker compose pull obsidian-mcp && docker compose up -d obsidian-mcp"
+            echo "docker inspect obsidian-mcp --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}'"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
