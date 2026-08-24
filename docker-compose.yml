@@ -112,12 +112,17 @@ services:
       # write; this stops the server from trying, so a blocked write returns a clean "vault is in
       # read-only mode" to the agent instead of an EROFS surfacing as an unexplained failure.
       #
-      # Enabling writes takes THREE changes, not one, and doing fewer fails in confusing ways:
-      #   1. VAULT_READ_ONLY=false here (compared with === 'true', so any other value allows)
-      #   2. comment out `read_only: true` on the vault-data mount below, or every write is EROFS
-      #   3. SYNC_MODE=bidirectional above, or the sync sidecar reverts each write within seconds
-      # Get 1 and 2 without 3 and writes succeed, report success, and then vanish — which is
-      # strictly worse than the clean refusal you get by leaving this alone.
+      # This one variable drives BOTH layers: it is interpolated into the mount's `read_only`
+      # below as well, because the two must never disagree. App-writable over a read-only mount
+      # turns every write into a bare EROFS; mount-writable under an app that refuses is merely
+      # confusing. Flipping one and forgetting the other was the likeliest way to misconfigure
+      # this, so it is no longer possible from .env.
+      #
+      # Enabling writes is therefore TWO settings, not one:
+      #   1. VAULT_READ_ONLY=false (compared with === 'true', so any other value allows writes)
+      #   2. SYNC_MODE=bidirectional above — without it the sidecar reverts each write in seconds
+      # Do 1 without 2 and writes succeed, report success, and then vanish. That is strictly
+      # worse than the clean refusal you get by leaving this alone.
       VAULT_READ_ONLY: ${VAULT_READ_ONLY:-true}
 
       # No tool-call log at all. Worth knowing exactly what this turns off: not just note bodies
@@ -141,7 +146,8 @@ services:
       TOKEN_STORE_PATH: /app/data/tokens.json
 
     volumes:
-      # Scoped to ONE folder of the vault, and read-only.
+      # Scoped to ONE folder of the vault, and read-only unless VAULT_READ_ONLY says otherwise
+      # (same variable as the env above — see the note there for why they are not separate).
       #
       # `subpath` is what makes this an allowlist rather than a denylist. The container's /vault
       # IS the AI folder — the rest of the vault is not in its mount namespace at all, so
@@ -158,7 +164,7 @@ services:
       - type: volume
         source: vault-data
         target: /vault
-        read_only: true
+        read_only: ${VAULT_READ_ONLY:-true}
         volume:
           subpath: ${AI_FOLDER:-AI}
       - mcp-tokens:/app/data
