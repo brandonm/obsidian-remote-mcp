@@ -99,7 +99,7 @@ services:
   obsidian-mcp:
     # Pin to an immutable tag in production. `:deploy` moves, so a `docker compose pull` could
     # swap the running code without any version changing. The sha tag, or the digest, cannot.
-    image: ${MCP_IMAGE:-ghcr.io/brandonm/obsidian-remote-mcp:sha-905c54b}
+    image: ${MCP_IMAGE:-ghcr.io/brandonm/obsidian-remote-mcp:sha-93e4851}
     container_name: obsidian-mcp
     restart: unless-stopped
     depends_on:
