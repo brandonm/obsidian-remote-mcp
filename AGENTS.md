@@ -143,7 +143,12 @@ MCP endpoint: `POST /mcp` (requires Bearer token)
 Two workflows, in `.github/workflows/`.
 
 `ci.yml` runs on every push and pull request: install (with `frozenLockfile`, so a stale `bun.lock`
-fails loudly), typecheck, `bun test`, and a documentation-drift check. It deliberately does not
+fails loudly), typecheck, `bun test`, and a documentation-drift check. The typecheck covers `src/`,
+`scripts/` and `test/`; `@types/bun` is a devDependency so `bun:test` resolves, and the three
+`TS2307`s from `web-clipper-headless` reaching for the uninstalled optional peer `obsidian-clipper/api`
+are counted and ignored rather than hidden. `scripts/typecheck.ts` exists rather than an inline
+`tsc | grep` because that form reports success when tsc cannot run at all — no output, no match, the
+`||` branch fires — and a gate that passes when the checker is missing is worse than no gate. It deliberately does not
 build the image — a Docker build is minutes that tell you nothing a failing test would not have
 told you first, and CI only gets read if it stays fast. `bun audit` runs advisory-only, so a new
 transitive advisory is visible without blocking an unrelated fix.
@@ -213,4 +218,7 @@ Uses a temporary `VAULT_PATH` and `VAULT_MCP_TEST=1` (see `package.json` `test` 
 
 - New package versions younger than 3 days aren't eligible — defends against malicious-publish supply-chain attacks (the May 2026 npm incident and its family).
 - `frozenLockfile = true` — commit `bun.lock` and never run `--no-frozen-lockfile` unless you have a reason.
+  (`@types/bun` was added that way, deliberately: `bun add` cannot write the lockfile while the
+  bunfig flag is set, and neither `--no-frozen-lockfile` nor `BUN_CONFIG_FROZEN_LOCKFILE=false`
+  overrides it — the flag has to be flipped in `bunfig.toml` for the add and flipped back.)
 - `exact = true` — `bun add <pkg>` saves the version without a caret.

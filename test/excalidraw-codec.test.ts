@@ -277,7 +277,7 @@ describe('the ## Text Elements section', () => {
 
   test('sync drops entries whose element is gone and updates changed text', () => {
     const scene = sampleScene();
-    (scene.elements.find(e => e.id === 'cccccccc') as { rawText: string }).rawText = 'renamed';
+    scene.elements.find(e => e.id === 'cccccccc')!.rawText = 'renamed';
     const md = syncTextElements(sampleDrawing(), scene);
     expect(parseTextElements(md).get('cccccccc')).toBe('renamed');
 
@@ -314,7 +314,7 @@ describe('building a scene from a node/edge spec', () => {
       for (const side of ['startBinding', 'endBinding'] as const) {
         const shape = byId.get((arrow[side] as { elementId: string }).elementId);
         expect(shape).toBeDefined();
-        expect(shape!.boundElements as { id: string }[]).toContainEqual({
+        expect(shape!.boundElements as { id: string; type: string }[]).toContainEqual({
           id: arrow.id,
           type: 'arrow',
         });
@@ -329,7 +329,7 @@ describe('building a scene from a node/edge spec', () => {
     expect(labels.length).toBeGreaterThanOrEqual(3);
     for (const label of labels) {
       const container = byId.get(label.containerId as string)!;
-      expect(container.boundElements as { id: string }[]).toContainEqual({
+      expect(container.boundElements as { id: string; type: string }[]).toContainEqual({
         id: label.id,
         type: 'text',
       });

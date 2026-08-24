@@ -6,10 +6,15 @@
     "strict": true,
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
-    "noEmit": true
+    "noEmit": true,
+    "types": [
+      "bun",
+      "node"
+    ]
   },
   "include": [
     "src",
-    "scripts"
+    "scripts",
+    "test"
   ]
 }
